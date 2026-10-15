@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["core", "airgap", "node", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+wallet-airgap = { path = "airgap" }
+wallet-core = { path = "core" }
+wallet-node = { path = "node" }
+
+bip39 = { version = "3", features = ["zeroize"] }
+bitcoin = { version = "0.32", features = ["base64"] }
+bitcoinconsensus = "0.106"
+clap = { version = "4.6.7", features = ["derive"] }
+# No accesskit (its Linux backend talks D-Bus), no wgpu: glow's OpenGL ES is what the
+# handhelds' Mali GPUs run under Mesa's Panfrost.
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
+egui_kittest = { version = "0.37", features = ["snapshot", "wgpu"] }
+getrandom = "0.4"
+gilrs = "0.11"
+miniscript = "13"
+# Plain HTTP to a node on this machine or the local network: no TLS stack.
+minreq = "3"
+qrcode = { version = "0.14", default-features = false }
+rqrr = { version = "0.11", default-features = false }
+serde_json = "1"
+thiserror = "2.0.21"
+ur = "0.5"
+zeroize = "1.9"

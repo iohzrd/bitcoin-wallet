@@ -1,0 +1,15 @@
+[package]
+name = "wallet-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bip39.workspace = true
+bitcoin.workspace = true
+miniscript.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+bitcoinconsensus.workspace = true

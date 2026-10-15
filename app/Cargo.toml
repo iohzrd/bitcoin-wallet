@@ -1,0 +1,23 @@
+[package]
+name = "wallet"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+online = ["dep:wallet-node"]
+
+[dependencies]
+clap.workspace = true
+eframe.workspace = true
+getrandom.workspace = true
+gilrs.workspace = true
+wallet-airgap.workspace = true
+wallet-core.workspace = true
+wallet-node = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+serde_json.workspace = true
+wallet-node = { workspace = true, features = ["test-support"] }
