@@ -245,7 +245,7 @@ pub fn address(ui: &mut Ui, address: &str, size: f32) -> Response {
 
 /// A text field drawn for the on-screen keyboard to type into: what is typed so far, the caret,
 /// and `trailing` faint at its right.
-pub fn field(ui: &mut Ui, value: &str, size: f32, trailing: Option<&str>) {
+pub fn field(ui: &mut Ui, value: &str, size: f32, trailing: Option<(&str, Color32)>) {
     Frame::new()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
@@ -261,9 +261,9 @@ pub fn field(ui: &mut Ui, value: &str, size: f32, trailing: Option<&str>) {
                     vec2(2.0, typed.rect.height().max(size) - 4.0),
                 );
                 ui.painter().rect_filled(caret, 1.0, ACCENT);
-                if let Some(trailing) = trailing {
+                if let Some((trailing, color)) = trailing {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        text(ui, trailing, mono(12.0), FAINT);
+                        text(ui, trailing, mono(12.0), color);
                     });
                 }
             });

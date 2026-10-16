@@ -129,6 +129,58 @@ pub fn write(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Where a wallet kept on the device lives: the XDG data directory's `wallet`, which the handheld
+/// images keep across updates with the rest of `/home`.
+pub fn default_data_dir() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|dir| dir.is_absolute());
+    let data = data.or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share")));
+    Some(data?.join("wallet"))
+}
+
+/// Writes `data` to `path` as `write` does, readable by this user alone, in a directory only this
+/// user can list.
+pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir)?;
+    }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&partial)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&partial, path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Overwrites the file at `path` with zeros and removes it. A card's flash moves what it writes
+/// as it wears, so the old blocks may outlast this until written over; what they hold is as safe
+/// as the passphrase that sealed it.
+pub fn erase(path: &Path) -> io::Result<()> {
+    let len = fs::metadata(path)?.len();
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    file.write_all(&vec![0; len as usize])?;
+    file.sync_all()?;
+    drop(file);
+    fs::remove_file(path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

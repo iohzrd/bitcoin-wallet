@@ -22,8 +22,21 @@ use crate::widgets::{
 pub fn start(ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
     ui.add_space(6.0);
     text(ui, "Open a wallet", strong(20.0), TEXT);
-    text(ui, "The seed lives in memory only. Nothing writes it to disk.", body(13.0), DIM);
+    let kept = shared.config.store.as_ref().is_some_and(|path| path.exists());
+    let about = match (&shared.config.store, kept) {
+        (_, true) => "A wallet is kept on this device, sealed under its passphrase.",
+        (Some(_), false) => "The seed lives in memory only, unless you choose to keep it.",
+        (None, false) => "The seed lives in memory only. Nothing writes it to disk.",
+    };
+    text(ui, about, body(13.0), DIM);
     ui.add_space(6.0);
+    if kept {
+        let unlock = menu_item(ui, "Unlock", Some("The wallet kept on this device"));
+        shared.autofocus(&unlock);
+        if unlock.clicked() {
+            return Some(Screen::Unlock(crate::keep::Unlock::default()));
+        }
+    }
     let new = menu_item(ui, "New seed", Some("Make 12 or 24 recovery words"));
     shared.autofocus(&new);
     if new.clicked() {
@@ -446,7 +459,7 @@ impl Restore {
             0 => entered.join("  "),
             _ => format!("…  {}", entered.join("  ")),
         };
-        field(ui, &self.prefix, 20.0, Some(&entered));
+        field(ui, &self.prefix, 20.0, Some((&entered, FAINT)));
         let english = wallet_core::bip39::Language::English;
         let candidates: Vec<&'static str> = match self.prefix.as_str() {
             "" => Vec::new(),
@@ -578,7 +591,7 @@ impl Setup {
     pub fn show(&mut self, ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
         if self.entering {
             let count = self.passphrase.chars().count();
-            field(ui, &self.passphrase, 18.0, Some(&format!("{count}")));
+            field(ui, &self.passphrase, 18.0, Some((&format!("{count}"), FAINT)));
             match self.keyboard.show(ui, Keys::Full, Some(shared.focus_flag())) {
                 Some(Press::Char(char)) => self.passphrase.push(char),
                 Some(Press::Backspace) => {
@@ -644,7 +657,13 @@ impl Setup {
                     shared.online.open(ui.ctx(), &account, self.restored.then_some(0));
                     #[cfg(not(feature = "online"))]
                     let _ = self.restored;
-                    shared.wallet = Some(Wallet::signing(self.mnemonic.clone(), seed, account));
+                    let mut wallet = Wallet::signing(self.mnemonic.clone(), seed, account);
+                    wallet.passphrase = self.passphrase.clone();
+                    // A new seed's coins can come no earlier than now; a restored one's, whenever.
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+                    let now = now.map_or(0, |since| since.as_secs());
+                    wallet.birthday = if self.restored { 0 } else { now };
+                    shared.wallet = Some(wallet);
                     return Some(Screen::Home(Default::default()));
                 }
                 Err(error) => shared.error(error),

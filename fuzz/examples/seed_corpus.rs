@@ -27,6 +27,36 @@ fn main() {
     psbts(&root.join("review"), &root.join("bcur"));
     setups(&root.join("setup"));
     seedqrs(&root.join("seedqr"));
+    stores(&root.join("store"));
+}
+
+/// Records as a kept wallet holds them, and a file sealing one at Argon2's least cost.
+fn stores(dir: &Path) {
+    use wallet_core::store::{self, Kept, KeptMultisig, Key, Params, Record};
+    let seed = Record {
+        network: wallet_fuzz::NETWORK,
+        birthday: 1_700_000_000,
+        wallet: Kept::Seed {
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".parse().unwrap(),
+            passphrase: Some(zeroize::Zeroizing::new("TREZOR".to_owned())),
+            fingerprint: "73c5da0a".parse().unwrap(),
+            kind: Kind::Taproot,
+        },
+        multisigs: vec![KeptMultisig {
+            descriptor: MULTISIG[0].descriptor().to_string(),
+            name: Some("Vault".to_owned()),
+        }],
+    };
+    let watch = Record {
+        wallet: Kept::Watch { descriptor: wallet_fuzz::TAPROOT.descriptor().to_string() },
+        multisigs: Vec::new(),
+        ..seed.clone()
+    };
+    write(dir, "seed", seed.encode().as_bytes());
+    write(dir, "watch", watch.encode().as_bytes());
+    let cheap = Params { memory_kib: 8, passes: 1, lanes: 1 };
+    let key = Key::derive("passphrase", [1; 16], cheap).unwrap();
+    write(dir, "sealed", store::seal(&key, [2; 24], &seed));
 }
 
 fn write(dir: &Path, name: &str, data: impl AsRef<[u8]>) {

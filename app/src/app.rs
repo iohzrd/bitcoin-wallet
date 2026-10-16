@@ -14,13 +14,15 @@ use wallet_core::account::Account;
 use wallet_core::bitcoin::Network;
 use wallet_core::multisig::Multisig;
 use wallet_core::seed::Seed;
+use wallet_core::store::Params;
+use zeroize::Zeroizing;
 
 use crate::gamepad::Gamepad;
 use crate::theme::{
     self, ACCENT, BAD, BG, DIM, GOOD, RADIUS, TEST_NETWORK, TEXT, body, mono, strong,
 };
 use crate::widgets::{Control, Hint, back_button, back_id, chip, hint_bar, text};
-use crate::{backup, cosign, create, home, sign};
+use crate::{backup, cosign, create, home, keep, sign};
 
 /// The widest the screens' column grows, on a desktop's window.
 const MAX_WIDTH: f32 = 560.0;
@@ -29,6 +31,10 @@ pub struct Config {
     pub network: Network,
     /// Where PSBTs and descriptors are read from and written to.
     pub dirs: Vec<PathBuf>,
+    /// The file a wallet is kept in, for whoever asks to keep one; `None` where keeping is off.
+    pub store: Option<PathBuf>,
+    /// What a kept wallet's key costs to make.
+    pub kdf: Params,
 }
 
 /// The open wallet: an account, and the seed it derives from unless it is watch-only.
@@ -36,9 +42,15 @@ pub struct Wallet {
     pub seed: Option<Seed>,
     /// The seed's words, for the backup screens.
     pub mnemonic: Option<Mnemonic>,
+    /// The seed's BIP39 passphrase, empty for none, for keeping the wallet with it.
+    pub passphrase: Zeroizing<String>,
     pub account: Account,
-    /// The multisig wallets the seed co-signs, registered for as long as the wallet is open.
+    /// The multisig wallets the seed co-signs, registered for as long as the wallet is open, or
+    /// kept with it.
     pub multisigs: Vec<Registered>,
+    /// The earliest its coins could have come, in Unix time: 0 for a restored seed, whose coins
+    /// a node must look back through the whole chain for.
+    pub birthday: u64,
 }
 
 /// A multisig wallet registered from a coordinator's setup file, and the name the file gave it.
@@ -49,12 +61,25 @@ pub struct Registered {
 
 impl Wallet {
     pub fn signing(mnemonic: Mnemonic, seed: Seed, account: Account) -> Wallet {
-        Wallet { seed: Some(seed), mnemonic: Some(mnemonic), account, multisigs: Vec::new() }
+        Wallet {
+            seed: Some(seed),
+            mnemonic: Some(mnemonic),
+            passphrase: Zeroizing::default(),
+            account,
+            multisigs: Vec::new(),
+            birthday: 0,
+        }
     }
 
-    #[cfg(feature = "online")]
     pub fn watching(account: Account) -> Wallet {
-        Wallet { seed: None, mnemonic: None, account, multisigs: Vec::new() }
+        Wallet {
+            seed: None,
+            mnemonic: None,
+            passphrase: Zeroizing::default(),
+            account,
+            multisigs: Vec::new(),
+            birthday: 0,
+        }
     }
 }
 
@@ -67,6 +92,8 @@ enum Notice {
 pub struct Shared {
     pub config: Config,
     pub wallet: Option<Wallet>,
+    /// The key the open wallet is kept under, when it is kept on the device.
+    pub kept: Option<keep::Kept>,
     #[cfg(feature = "online")]
     pub online: crate::online::Online,
     /// A message for the top of the screen, and the frame it was set in.
@@ -108,6 +135,17 @@ impl Shared {
         self.notice = Some((Notice::Error(error.to_string()), self.frame));
     }
 
+    /// Writes the open wallet to its file again, when it is kept, for a change to it to last.
+    pub fn save(&mut self) {
+        let (Some(kept), Some(wallet), Some(path)) = (&self.kept, &self.wallet, &self.config.store)
+        else {
+            return;
+        };
+        if let Err(error) = keep::save(path, kept, wallet, self.config.network) {
+            self.error(format!("Keeping the wallet: {error}"));
+        }
+    }
+
     /// The open wallet's seed, when it has one.
     pub fn seed(&self) -> Option<&Seed> {
         self.wallet.as_ref().and_then(|wallet| wallet.seed.as_ref())
@@ -132,6 +170,8 @@ pub enum Screen {
     CosignerKey(cosign::KeyExport),
     Register(cosign::Register),
     MultisigWallet(cosign::WalletScreen),
+    Keep(keep::Keep),
+    Unlock(keep::Unlock),
     #[cfg(feature = "online")]
     Import(crate::online::Import),
     #[cfg(feature = "online")]
@@ -162,6 +202,8 @@ impl Screen {
             Screen::CosignerKey(_) => "Your multisig key".to_owned(),
             Screen::Register(_) => "Register a wallet".to_owned(),
             Screen::MultisigWallet(screen) => screen.title(),
+            Screen::Keep(screen) => screen.title(),
+            Screen::Unlock(screen) => screen.title(),
             #[cfg(feature = "online")]
             Screen::Import(_) => "Watch an account".to_owned(),
             #[cfg(feature = "online")]
@@ -184,6 +226,8 @@ impl Screen {
             Screen::Generate(screen) => screen.hints(),
             Screen::Restore(screen) => screen.hints(),
             Screen::Setup(screen) => screen.hints(),
+            Screen::Keep(screen) => screen.hints(),
+            Screen::Unlock(screen) => screen.hints(),
             Screen::Addresses(_) => &[
                 (Control::Shoulders, "Previous / next"),
                 (Control::A, "Select"),
@@ -216,6 +260,8 @@ impl Screen {
             Screen::CosignerKey(screen) => screen.show(ui, shared),
             Screen::Register(screen) => screen.show(ui, shared),
             Screen::MultisigWallet(screen) => screen.show(ui, shared),
+            Screen::Keep(screen) => screen.show(ui, shared),
+            Screen::Unlock(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]
             Screen::Import(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]
@@ -246,6 +292,7 @@ impl App {
         let shared = Shared {
             config,
             wallet: None,
+            kept: None,
             #[cfg(feature = "online")]
             online,
             notice: None,
@@ -370,6 +417,11 @@ impl App {
     #[cfg(test)]
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    #[cfg(test)]
+    pub fn screen_title(&self) -> String {
+        self.screen.title()
     }
 
     #[cfg(test)]

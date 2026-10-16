@@ -14,9 +14,13 @@ wallet-airgap = { path = "airgap" }
 wallet-core = { path = "core" }
 wallet-node = { path = "node" }
 
+# The kept wallet's key from its passphrase, its lanes on threads of their own.
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "parallel", "zeroize"] }
 bip39 = { version = "3", features = ["zeroize"] }
 bitcoin = { version = "0.32", features = ["base64"] }
 bitcoinconsensus = "0.106"
+# Core draws no randomness of its own: the app passes in each nonce.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.7", features = ["derive"] }
 # No accesskit (its Linux backend talks D-Bus), no wgpu: glow's OpenGL ES is what the
 # handhelds' Mali GPUs run under Mesa's Panfrost.
@@ -33,3 +37,7 @@ serde_json = "1"
 thiserror = "2.0.21"
 ur = "0.5"
 zeroize = "1.9"
+
+# Unlocking a kept wallet takes seconds of Argon2 optimized and minutes of it not.
+[profile.dev.package.argon2]
+opt-level = 3

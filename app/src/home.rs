@@ -9,6 +9,7 @@ use crate::app::{Screen, Shared};
 use crate::backup::Backup;
 use crate::cosign::Cosign;
 use crate::files;
+use crate::keep::Keep;
 use crate::sign::{Files, Purpose, Which};
 use crate::theme::{ACCENT, DIM, FAINT, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
@@ -93,16 +94,27 @@ impl Home {
                     next = Some(Screen::Cosign(Cosign));
                 }
             }
-            let close = match (self.closing, signer) {
-                (true, true) => "Press again: the seed will be forgotten",
-                (true, false) => "Press again to close",
-                (false, _) => "Back to the start",
+            if shared.config.store.is_some() {
+                let detail = match shared.kept.is_some() {
+                    true => "Kept, sealed. Change or forget it",
+                    false => "Off: closing the wallet forgets it",
+                };
+                if menu_item(ui, "Keep on this device", Some(detail)).clicked() {
+                    next = Some(Screen::Keep(Keep::new(shared)));
+                }
+            }
+            let close = match (self.closing, signer, shared.kept.is_some()) {
+                (true, _, true) => "Press again: it stays kept, locked",
+                (true, true, false) => "Press again: the seed will be forgotten",
+                (true, false, false) => "Press again to close",
+                (false, ..) => "Back to the start",
             };
             let close = menu_item(ui, "Close wallet", Some(close));
             if close.clicked() {
                 if self.closing {
-                    // Dropping the seed wipes it.
+                    // Dropping the seed wipes it, and the key it was kept under.
                     shared.wallet = None;
+                    shared.kept = None;
                     #[cfg(feature = "online")]
                     shared.online.close();
                     next = Some(Screen::Start);

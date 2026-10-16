@@ -165,7 +165,10 @@ impl Register {
         }
         if let Some(path) = chosen {
             match register(shared, &path) {
-                Ok(index) => return Some(Screen::MultisigWallet(WalletScreen::new(index))),
+                Ok(index) => {
+                    shared.save();
+                    return Some(Screen::MultisigWallet(WalletScreen::new(index)));
+                }
                 Err(error) => shared.error(format!("{}: {error}", path.display())),
             }
         }
@@ -253,9 +256,10 @@ impl WalletScreen {
             if menu_item(ui, "Addresses", Some("Check one the coordinator shows")).clicked() {
                 next = Some(Screen::Addresses(Addresses::new(Which::Multisig(self.index))));
             }
-            let forget = match self.forgetting {
-                true => "Press again to forget it",
-                false => "Register it again to sign for it",
+            let forget = match (self.forgetting, shared.kept.is_some()) {
+                (true, _) => "Press again to forget it",
+                (false, true) => "Off this device too; register it again to sign",
+                (false, false) => "Register it again to sign for it",
             };
             let forget = menu_item(ui, "Forget this wallet", Some(forget));
             if forget.clicked() {
@@ -263,6 +267,7 @@ impl WalletScreen {
                     if let Some(wallet) = shared.wallet.as_mut() {
                         wallet.multisigs.remove(self.index);
                     }
+                    shared.save();
                     next = Some(Screen::Cosign(Cosign));
                 }
                 self.forgetting = true;

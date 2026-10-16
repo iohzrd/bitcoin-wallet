@@ -10,6 +10,7 @@ pub mod multisig;
 pub mod policy;
 pub mod psbt;
 pub mod seed;
+pub mod store;
 #[cfg(test)]
 mod testing;
 

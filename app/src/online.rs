@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, Align, Layout, Margin, TextEdit, Ui};
 use wallet_airgap::qr::Qr;
@@ -18,6 +17,7 @@ use crate::app::{Screen, Shared, Wallet};
 use crate::files;
 use crate::home::Home;
 use crate::sign::{Origin, Review, Which};
+use crate::task::Task;
 use crate::theme::{ACCENT, BAD, DIM, FAINT, GOOD, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
     Emphasis, address, amount, back_pressed, beside_qr, button, chip, menu_item, text,
@@ -76,27 +76,6 @@ impl NodeArgs {
         let watch = self.watch.as_ref()?;
         let text = std::fs::read_to_string(watch).unwrap_or_else(|_| watch.clone());
         Some(Account::from_descriptor(text.trim(), network).map_err(|error| error.to_string()))
-    }
-}
-
-/// A call to the node on a thread of its own.
-pub struct Task<T> {
-    result: Receiver<T>,
-}
-
-impl<T: Send + 'static> Task<T> {
-    pub fn spawn(ctx: &egui::Context, call: impl FnOnce() -> T + Send + 'static) -> Task<T> {
-        let (send, result) = channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = send.send(call());
-            ctx.request_repaint();
-        });
-        Task { result }
-    }
-
-    pub fn poll(&self) -> Option<T> {
-        self.result.try_recv().ok()
     }
 }
 

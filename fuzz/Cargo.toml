@@ -13,6 +13,7 @@ bitcoinconsensus = "0.106"
 libfuzzer-sys = "0.4"
 wallet-airgap = { path = "../airgap" }
 wallet-core = { path = "../core" }
+zeroize = "1.9"
 
 # A workspace of its own: cargo-fuzz builds it with instrumentation the wallet's builds go without.
 [workspace]
@@ -52,6 +53,13 @@ bench = false
 [[bin]]
 name = "seedqr"
 path = "fuzz_targets/seedqr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store"
+path = "fuzz_targets/store.rs"
 test = false
 doc = false
 bench = false

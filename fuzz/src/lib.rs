@@ -13,7 +13,8 @@
 //! `review` reads any bytes as a PSBT; `transaction` builds PSBTs around the wallets, and checks
 //! what the review of each must say and what signing must do, down to Bitcoin Core's script
 //! interpreter; `setup` reads multisig setup files and descriptors; `bcur` and `bcur-loop` read UR
-//! parts and round-trip PSBTs through loops; `seedqr` decodes SeedQRs and dice rolls.
+//! parts and round-trip PSBTs through loops; `seedqr` decodes SeedQRs and dice rolls; `store`
+//! reads kept wallets' files and records.
 
 use std::sync::LazyLock;
 

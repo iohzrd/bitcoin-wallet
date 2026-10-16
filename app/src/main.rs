@@ -1,5 +1,5 @@
-//! The wallet: a signer that keeps its seed in memory and takes PSBTs in and out as files and QR
-//! codes, and, built with the `online` feature, the watch-only wallet that funds them through a
+//! The wallet: a signer that keeps its seed in memory, and on the device, encrypted, only if asked
+//! to, and takes PSBTs in and out as files and QR codes, and, built with the `online` feature, the watch-only wallet that funds them through a
 //! node and broadcasts them signed. The same screens run on a desktop with a mouse and keyboard and
 //! on a handheld with a D-pad.
 
@@ -10,9 +10,11 @@ mod create;
 mod files;
 mod gamepad;
 mod home;
+mod keep;
 #[cfg(feature = "online")]
 mod online;
 mod sign;
+mod task;
 mod theme;
 #[cfg(test)]
 mod ui_tests;
@@ -23,6 +25,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 use wallet_core::bitcoin::Network;
+use wallet_core::store::Params;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -34,6 +37,13 @@ struct Args {
     /// every mounted removable volume]
     #[arg(long = "dir")]
     dirs: Vec<PathBuf>,
+    /// Where a wallet kept on the device is kept, encrypted [default: $XDG_DATA_HOME/wallet, or
+    /// ~/.local/share/wallet]
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Never keep a wallet on the device, as a signer that should hold nothing once it is off
+    #[arg(long, conflicts_with = "data_dir")]
+    no_store: bool,
     /// Fill the screen, as on a handheld
     #[arg(long)]
     fullscreen: bool,
@@ -51,7 +61,9 @@ struct Args {
 fn main() -> eframe::Result {
     let args = Args::parse();
     let dirs = if args.dirs.is_empty() { files::default_dirs() } else { args.dirs.clone() };
-    let config = app::Config { network: args.network, dirs };
+    let data_dir = args.data_dir.clone().or_else(files::default_data_dir);
+    let store = data_dir.filter(|_| !args.no_store).map(|dir| keep::path(&dir, args.network));
+    let config = app::Config { network: args.network, dirs, store, kdf: Params::DEFAULT };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Wallet")
