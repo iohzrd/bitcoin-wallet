@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["core", "airgap", "node", "app"]
+# The fuzz targets build with cargo-fuzz, in a workspace of their own.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,70 @@
+[package]
+name = "wallet-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.5", features = ["derive"] }
+bitcoinconsensus = "0.106"
+libfuzzer-sys = "0.4"
+wallet-airgap = { path = "../airgap" }
+wallet-core = { path = "../core" }
+
+# A workspace of its own: cargo-fuzz builds it with instrumentation the wallet's builds go without.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "review"
+path = "fuzz_targets/review.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "setup"
+path = "fuzz_targets/setup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bcur"
+path = "fuzz_targets/bcur.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seedqr"
+path = "fuzz_targets/seedqr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bcur-loop"
+path = "fuzz_targets/bcur_loop.rs"
+test = false
+doc = false
+bench = false
+
+# Writes the corpus the targets start from: `cargo run --manifest-path fuzz/Cargo.toml --example
+# seed-corpus`. An example, so that cargo-fuzz does not take it for a target.
+[[example]]
+name = "seed-corpus"
+path = "examples/seed_corpus.rs"
