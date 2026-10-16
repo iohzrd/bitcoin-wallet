@@ -152,6 +152,28 @@ fn a_new_seed_is_made_written_down_checked_and_opened_with_the_gamepad_alone() {
 }
 
 #[test]
+fn fifty_dice_rolls_make_the_seed_seedsigner_makes_of_them() {
+    let mut harness = harness(app(Vec::new()));
+    press(&mut harness, Key::Enter); // New seed
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::Enter); // 12 words from dice
+    shown(&harness, "0 of 50");
+    // The first roll with the D-pad on the faces: 1, then a 2 taken back with B.
+    press(&mut harness, Key::Enter);
+    press(&mut harness, Key::ArrowRight);
+    press(&mut harness, Key::Enter);
+    shown(&harness, "12");
+    press(&mut harness, Key::Escape);
+    shown(&harness, "1 of 50");
+    // The rest on a keyboard.
+    type_text(&mut harness, &"1".repeat(49));
+    let Screen::Generate(generate) = harness.state().screen() else { panic!("left the seed") };
+    let words = generate.shown_words().expect("the words, once the rolls are in").join(" ");
+    assert_eq!(words, "diet glad hat rural panther lawsuit act drop gallery urge where fit");
+}
+
+#[test]
 fn a_wrong_word_in_the_check_goes_back_to_the_words() {
     let mut harness = harness(app(Vec::new()));
     press(&mut harness, Key::Enter);
@@ -301,6 +323,17 @@ fn screenshots() {
         shot(&mut harness, "01-start");
         press(&mut harness, Key::Enter);
         shot(&mut harness, "02-length");
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::Enter); // 12 words from dice
+        shot(&mut harness, "02a-dice-empty");
+        type_text(&mut harness, "16253416252341664312513");
+        press(&mut harness, Key::ArrowRight);
+        press(&mut harness, Key::ArrowRight);
+        shot(&mut harness, "02b-dice");
+        for _ in 0..24 {
+            press(&mut harness, Key::Escape);
+        }
         press(&mut harness, Key::ArrowDown);
         press(&mut harness, Key::Enter); // 24 words
         shot(&mut harness, "03-words");

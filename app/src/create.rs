@@ -2,19 +2,20 @@
 //! passphrase and its kind of account. The seed lives in memory only; nothing here writes it
 //! anywhere, so closing the app or the wallet forgets it.
 
-use eframe::egui::{Button, Grid, RichText, Ui, vec2};
+use eframe::egui::{Button, Event, Grid, Key, RichText, ScrollArea, Ui, vec2};
 use wallet_core::Mnemonic;
 use wallet_core::account::{Account, Kind};
 use wallet_core::bitcoin::bip32::Fingerprint;
 use wallet_core::bitcoin::secp256k1::Secp256k1;
+use wallet_core::dice;
 use wallet_core::seed::Seed;
 use zeroize::Zeroizing;
 
 use crate::app::{Screen, Shared, Wallet};
 use crate::theme::{ACCENT, DIM, FAINT, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
-    Control, Emphasis, Hint, Keyboard, Keys, Press, back_pressed, button, button_row, card, field,
-    menu_item, page_dots, progress, text,
+    Control, Emphasis, Hint, Keyboard, Keys, Press, back_pressed, button, button_row, card,
+    die_button, field, menu_item, page_dots, progress, text,
 };
 
 pub fn start(ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
@@ -46,6 +47,8 @@ pub struct Generate {
 enum Stage {
     #[default]
     Length,
+    /// Taking dice rolls, until there are `needed`.
+    Dice { rolls: Zeroizing<Vec<u8>>, needed: usize },
     /// The words, a page of `PAGE` at a time.
     Words { mnemonic: Mnemonic, page: usize },
     /// Asking for some of the words back, to know they were written down.
@@ -67,10 +70,20 @@ impl Generate {
     pub fn title(&self) -> String {
         match self.stage {
             Stage::Length => "New seed",
+            Stage::Dice { .. } => "Dice rolls",
             Stage::Words { .. } => "Recovery words",
             Stage::Check { .. } => "Check your copy",
         }
         .to_owned()
+    }
+
+    pub fn hints(&self) -> &'static [Hint] {
+        match self.stage {
+            Stage::Dice { .. } => {
+                &[(Control::DPad, "Move"), (Control::A, "Enter roll"), (Control::B, "Undo")]
+            }
+            _ => &[(Control::DPad, "Move"), (Control::A, "Select"), (Control::B, "Back")],
+        }
     }
 
     pub fn show(&mut self, ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
@@ -78,21 +91,97 @@ impl Generate {
         let mut stage = None;
         let screen = match &mut self.stage {
             Stage::Length => {
-                ui.add_space(6.0);
-                text(ui, "How many words?", strong(18.0), TEXT);
-                text(ui, "Either is safe. More words take longer to write down.", body(13.0), DIM);
-                ui.add_space(6.0);
-                for (words, entropy, about) in [(12, 16, "128 bits"), (24, 32, "256 bits")] {
-                    let button = menu_item(ui, &format!("{words} words"), Some(about));
-                    shared.autofocus(&button);
-                    if button.clicked() {
-                        match new_mnemonic(entropy) {
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    let about = "Dice spare you trusting this device's randomness.";
+                    text(ui, about, body(12.5), DIM);
+                    for (words, entropy) in [(12, 16), (24, 32)] {
+                        let title = format!("{words} words");
+                        let button = menu_item(ui, &title, Some("From this device's randomness"));
+                        shared.autofocus(&button);
+                        if button.clicked() {
+                            match new_mnemonic(entropy) {
+                                Ok(mnemonic) => stage = Some(Stage::Words { mnemonic, page: 0 }),
+                                Err(error) => shared.error(error),
+                            }
+                        }
+                    }
+                    for words in [12, 24] {
+                        let needed = dice::rolls_for(words).expect("12 and 24 words take rolls");
+                        let title = format!("{words} words from dice");
+                        let about = format!("Roll a die {needed} times");
+                        if menu_item(ui, &title, Some(&about)).clicked() {
+                            stage = Some(Stage::Dice { rolls: Zeroizing::default(), needed });
+                        }
+                    }
+                });
+                back_pressed(ui).then_some(Screen::Start)
+            }
+            Stage::Dice { rolls, needed } => {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                progress(ui, rolls.len() as f32 / *needed as f32);
+                ui.horizontal(|ui| {
+                    text(ui, "Roll a die and enter the face it shows.", body(12.5), DIM);
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| text(ui, format!("{} of {needed}", rolls.len()), mono(12.5), TEXT),
+                    );
+                });
+                // In an id scope, as its lines grow above the faces.
+                ui.push_id("rolls", |ui| {
+                    card(ui, |ui| match rolls.is_empty() {
+                        true => {
+                            let about = "The rolls show here in fives, to check against paper.";
+                            text(ui, about, body(12.5), FAINT)
+                        }
+                        false => text(ui, in_fives(rolls), mono(15.0), TEXT),
+                    });
+                });
+                let mut rolled = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let side = ((ui.available_width() - 5.0 * 8.0) / 6.0).min(60.0);
+                    // Centered, when a wide window leaves room on either side.
+                    let room = ui.available_width() - 6.0 * side - 5.0 * 8.0;
+                    if room > 0.0 {
+                        ui.add_space(room / 2.0);
+                    }
+                    for face in 1..=6 {
+                        let button = die_button(ui, face, side);
+                        shared.autofocus(&button);
+                        if button.clicked() {
+                            rolled = Some(face);
+                        }
+                    }
+                });
+                let typed = ui.input(|input| {
+                    let mut faces = input.events.iter().filter_map(|event| match event {
+                        Event::Text(text) => text.chars().find(|c| ('1'..='6').contains(c)),
+                        _ => None,
+                    });
+                    faces.next_back().map(|face| face as u8 - b'0')
+                });
+                let undo = ui.add_enabled_ui(!rolls.is_empty(), |ui| {
+                    button(ui, "Undo the last roll", Emphasis::Secondary, ui.available_width())
+                });
+                let about = "SeedSigner and Coldcard make the same words from the same rolls.";
+                text(ui, about, body(11.5), FAINT);
+                let backspace = ui.input(|input| input.key_pressed(Key::Backspace));
+                if let Some(face) = rolled.or(typed) {
+                    rolls.push(face);
+                    if rolls.len() == *needed {
+                        match dice::mnemonic(rolls) {
                             Ok(mnemonic) => stage = Some(Stage::Words { mnemonic, page: 0 }),
                             Err(error) => shared.error(error),
                         }
                     }
+                } else if undo.inner.clicked() || backspace || back_pressed(ui) {
+                    if rolls.pop().is_none() {
+                        stage = Some(Stage::Length);
+                    }
+                    // B is Escape, which takes the focus away; give it back to the faces.
+                    shared.refocus();
                 }
-                back_pressed(ui).then_some(Screen::Start)
+                None
             }
             Stage::Words { mnemonic, page } => {
                 let words: Vec<&str> = mnemonic.words().collect();
@@ -206,6 +295,15 @@ impl Generate {
         let question = &questions[*asked];
         Some((mnemonic.words().nth(question.position)?, question.choices))
     }
+}
+
+/// Rolls as their digits in groups of five, the way they are easiest to check against paper.
+fn in_fives(rolls: &[u8]) -> String {
+    let groups: Vec<String> = rolls
+        .chunks(5)
+        .map(|group| group.iter().map(|roll| char::from(b'0' + roll)).collect())
+        .collect();
+    groups.join(" ")
 }
 
 /// A seed of `bytes` bytes of the operating system's randomness.

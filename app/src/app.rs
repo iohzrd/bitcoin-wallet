@@ -144,6 +144,7 @@ impl Screen {
     fn hints(&self) -> &'static [Hint] {
         match self {
             Screen::Start => &[(Control::DPad, "Move"), (Control::A, "Select")],
+            Screen::Generate(screen) => screen.hints(),
             Screen::Restore(screen) => screen.hints(),
             Screen::Setup(screen) => screen.hints(),
             Screen::Addresses(_) => &[

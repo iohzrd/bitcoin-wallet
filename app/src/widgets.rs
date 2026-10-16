@@ -278,6 +278,36 @@ pub fn progress(ui: &mut Ui, fraction: f32) {
     ui.painter().rect_filled(done, 2.0, ACCENT);
 }
 
+/// A die's face as a button, its pips drawn, for entering the face a roll showed.
+pub fn die_button(ui: &mut Ui, face: u8, side: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, true, face.to_string()));
+    follow_focus(&response);
+    if ui.is_rect_visible(rect) {
+        let (fill, pip) = match (response.has_focus(), response.hovered()) {
+            (true, _) => (ACCENT, ON_ACCENT),
+            (false, true) => (HOVER, TEXT),
+            (false, false) => (RAISED, TEXT),
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, side * 0.18, fill);
+        let pips = rect.shrink(side * 0.24);
+        // Each pip's place on a 3 by 3 grid, as a die has them.
+        let places: &[(f32, f32)] = match face {
+            1 => &[(0.5, 0.5)],
+            2 => &[(0.0, 0.0), (1.0, 1.0)],
+            3 => &[(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)],
+            4 => &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+            5 => &[(0.0, 0.0), (1.0, 0.0), (0.5, 0.5), (0.0, 1.0), (1.0, 1.0)],
+            _ => &[(0.0, 0.0), (1.0, 0.0), (0.0, 0.5), (1.0, 0.5), (0.0, 1.0), (1.0, 1.0)],
+        };
+        for &(x, y) in places {
+            painter.circle_filled(pips.lerp_inside(vec2(x, y)), side * 0.085, pip);
+        }
+    }
+    response
+}
+
 /// A small label on a tinted pill.
 pub fn chip(ui: &mut Ui, text: &str, font: FontId, color: Color32) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);

@@ -5,6 +5,7 @@
 //! need and every function here deterministic under test.
 
 pub mod account;
+pub mod dice;
 pub mod psbt;
 pub mod seed;
 
