@@ -61,6 +61,51 @@ pub fn list_psbts(dirs: &[PathBuf]) -> Vec<PsbtFile> {
     files
 }
 
+/// The `.txt` files in `dirs` that hold a descriptor beginning with one of `scripts`, such as
+/// `wsh(` for a multisig wallet's. Files too large to be a descriptor are passed over unread.
+#[cfg_attr(not(feature = "online"), allow(dead_code))]
+pub fn descriptor_files(dirs: &[PathBuf], scripts: &[&str]) -> Vec<PathBuf> {
+    const MAX: u64 = MAX_TEXT;
+    let mut files: Vec<PathBuf> = (dirs.iter())
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.metadata().is_ok_and(|meta| meta.is_file() && meta.len() <= MAX))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("txt")))
+        .filter(|path| {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            scripts.iter().any(|script| text.trim_start().starts_with(script))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The `.txt` and `.bsms` files in `dirs` that hold a multisig setup a coordinator wrote: a
+/// descriptor, a BSMS record or a Coldcard setup file.
+pub fn setup_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = (dirs.iter())
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.metadata().is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_TEXT))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let extension = path.extension().map(|ext| ext.to_ascii_lowercase());
+            extension.is_some_and(|ext| ext == "txt" || ext == "bsms")
+        })
+        .filter(|path| {
+            wallet_airgap::setup::looks_like(&fs::read_to_string(path).unwrap_or_default())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The largest text file read in looking for descriptors and setups.
+const MAX_TEXT: u64 = 64 * 1024;
+
 /// Where the signed PSBT of the one at `path` goes: beside it, `name.psbt` as `name-signed.psbt`.
 pub fn signed_path(path: &Path) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();

@@ -9,8 +9,10 @@ use eframe::egui::{
     self, Align, CentralPanel, Frame, Key, Layout, Margin, Panel, RawInput, Rect, Stroke, Ui,
     UiBuilder, pos2, vec2,
 };
+use wallet_core::Mnemonic;
 use wallet_core::account::Account;
 use wallet_core::bitcoin::Network;
+use wallet_core::multisig::Multisig;
 use wallet_core::seed::Seed;
 
 use crate::gamepad::Gamepad;
@@ -18,7 +20,7 @@ use crate::theme::{
     self, ACCENT, BAD, BG, DIM, GOOD, RADIUS, TEST_NETWORK, TEXT, body, mono, strong,
 };
 use crate::widgets::{Control, Hint, back_button, back_id, chip, hint_bar, text};
-use crate::{create, home, sign};
+use crate::{backup, cosign, create, home, sign};
 
 /// The widest the screens' column grows, on a desktop's window.
 const MAX_WIDTH: f32 = 560.0;
@@ -32,7 +34,28 @@ pub struct Config {
 /// The open wallet: an account, and the seed it derives from unless it is watch-only.
 pub struct Wallet {
     pub seed: Option<Seed>,
+    /// The seed's words, for the backup screens.
+    pub mnemonic: Option<Mnemonic>,
     pub account: Account,
+    /// The multisig wallets the seed co-signs, registered for as long as the wallet is open.
+    pub multisigs: Vec<Registered>,
+}
+
+/// A multisig wallet registered from a coordinator's setup file, and the name the file gave it.
+pub struct Registered {
+    pub multisig: Multisig,
+    pub name: Option<String>,
+}
+
+impl Wallet {
+    pub fn signing(mnemonic: Mnemonic, seed: Seed, account: Account) -> Wallet {
+        Wallet { seed: Some(seed), mnemonic: Some(mnemonic), account, multisigs: Vec::new() }
+    }
+
+    #[cfg(feature = "online")]
+    pub fn watching(account: Account) -> Wallet {
+        Wallet { seed: None, mnemonic: None, account, multisigs: Vec::new() }
+    }
 }
 
 enum Notice {
@@ -102,6 +125,13 @@ pub enum Screen {
     Files(sign::Files),
     Review(sign::Review),
     Outgoing(sign::Outgoing),
+    Backup(backup::Backup),
+    BackupWords(backup::Words),
+    SeedQr(backup::SeedQr),
+    Cosign(cosign::Cosign),
+    CosignerKey(cosign::KeyExport),
+    Register(cosign::Register),
+    MultisigWallet(cosign::WalletScreen),
     #[cfg(feature = "online")]
     Import(crate::online::Import),
     #[cfg(feature = "online")]
@@ -125,6 +155,13 @@ impl Screen {
             Screen::Files(screen) => screen.title(),
             Screen::Review(_) => "Review".to_owned(),
             Screen::Outgoing(screen) => screen.title(),
+            Screen::Backup(_) => "Backup".to_owned(),
+            Screen::BackupWords(_) => "Recovery words".to_owned(),
+            Screen::SeedQr(_) => "SeedQR".to_owned(),
+            Screen::Cosign(_) => "Multisig".to_owned(),
+            Screen::CosignerKey(_) => "Your multisig key".to_owned(),
+            Screen::Register(_) => "Register a wallet".to_owned(),
+            Screen::MultisigWallet(screen) => screen.title(),
             #[cfg(feature = "online")]
             Screen::Import(_) => "Watch an account".to_owned(),
             #[cfg(feature = "online")]
@@ -172,6 +209,13 @@ impl Screen {
             Screen::Files(screen) => screen.show(ui, shared),
             Screen::Review(screen) => screen.show(ui, shared),
             Screen::Outgoing(screen) => screen.show(ui, shared),
+            Screen::Backup(screen) => screen.show(ui, shared),
+            Screen::BackupWords(screen) => screen.show(ui, shared),
+            Screen::SeedQr(screen) => screen.show(ui, shared),
+            Screen::Cosign(screen) => screen.show(ui, shared),
+            Screen::CosignerKey(screen) => screen.show(ui, shared),
+            Screen::Register(screen) => screen.show(ui, shared),
+            Screen::MultisigWallet(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]
             Screen::Import(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]
@@ -220,7 +264,7 @@ impl App {
     #[cfg(feature = "online")]
     pub fn open_watch_only(&mut self, account: Account, ctx: &egui::Context) {
         self.shared.online.open(ctx, &account, Some(0));
-        self.shared.wallet = Some(Wallet { seed: None, account });
+        self.shared.wallet = Some(Wallet::watching(account));
         self.screen = Screen::Home(home::Home::default());
     }
 

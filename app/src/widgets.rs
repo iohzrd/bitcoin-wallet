@@ -313,6 +313,7 @@ pub fn chip(ui: &mut Ui, text: &str, font: FontId, color: Color32) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let size = galley.size() + vec2(14.0, 6.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, text));
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(255), color.gamma_multiply(0.14));
     painter.galley(rect.center() - galley.size() / 2.0, galley, color);
@@ -333,6 +334,16 @@ pub fn page_dots(ui: &mut Ui, page: usize, count: usize) {
 /// number of pixels wide and on the pixel grid, as a blurred module edge is what makes a camera
 /// misread one.
 pub fn qr_card(ui: &mut Ui, qr: &Qr, side: f32) -> Response {
+    paint_qr(ui, qr, side, false)
+}
+
+/// `qr_card` with lines between the modules, darker every fifth, for copying the code onto a
+/// paper template square by square, as a SeedQR is.
+pub fn qr_grid_card(ui: &mut Ui, qr: &Qr, side: f32) -> Response {
+    paint_qr(ui, qr, side, true)
+}
+
+fn paint_qr(ui: &mut Ui, qr: &Qr, side: f32, grid: bool) -> Response {
     let modules = qr.width() + 2 * QUIET_ZONE;
     let pixels_per_point = ui.ctx().pixels_per_point();
     let module_px = ((side * pixels_per_point) / modules as f32).floor().max(1.0);
@@ -356,6 +367,20 @@ pub fn qr_card(ui: &mut Ui, qr: &Qr, side: f32) -> Response {
         }
     }
     painter.add(mesh);
+    if grid {
+        let code = Rect::from_min_size(
+            origin + Vec2::splat(QUIET_ZONE as f32 * module),
+            Vec2::splat(qr.width() as f32 * module),
+        );
+        for line in 0..=qr.width() {
+            let at = line as f32 * module;
+            let color =
+                if line % 5 == 0 { Color32::from_gray(150) } else { Color32::from_gray(205) };
+            let stroke = Stroke::new(1.0 / pixels_per_point, color);
+            painter.vline(code.left() + at, code.y_range(), stroke);
+            painter.hline(code.x_range(), code.top() + at, stroke);
+        }
+    }
     response
 }
 

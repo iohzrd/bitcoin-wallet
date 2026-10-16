@@ -140,6 +140,11 @@ impl Node {
         self.call_at(&self.url, method, params, Some(TIMEOUT))
     }
 
+    /// Calls `method` on the node's wallet named `wallet`.
+    pub fn call_wallet(&self, wallet: &str, method: &str, params: Value) -> Result<Value, Error> {
+        self.call_at(&format!("{}/wallet/{wallet}", self.url), method, params, Some(TIMEOUT))
+    }
+
     fn call_at(
         &self,
         url: &str,

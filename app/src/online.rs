@@ -15,8 +15,9 @@ use wallet_core::bitcoin::{Address, Amount, Denomination, Network, Txid};
 use wallet_node::{Auth, Balance, Entry, Node};
 
 use crate::app::{Screen, Shared, Wallet};
+use crate::files;
 use crate::home::Home;
-use crate::sign::{Origin, Review};
+use crate::sign::{Origin, Review, Which};
 use crate::theme::{ACCENT, BAD, DIM, FAINT, GOOD, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
     Emphasis, address, amount, back_pressed, beside_qr, button, chip, menu_item, text,
@@ -294,7 +295,10 @@ pub struct Import {
 
 impl Import {
     pub fn new(shared: &Shared) -> Import {
-        Import { text: String::new(), files: descriptor_files(&shared.config.dirs) }
+        Import {
+            text: String::new(),
+            files: files::descriptor_files(&shared.config.dirs, &["wpkh(", "tr("]),
+        }
     }
 
     pub fn show(&mut self, ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
@@ -326,7 +330,7 @@ impl Import {
             match Account::from_descriptor(text.trim(), network) {
                 Ok(account) => {
                     shared.online.open(ui.ctx(), &account, Some(0));
-                    shared.wallet = Some(Wallet { seed: None, account });
+                    shared.wallet = Some(Wallet::watching(account));
                     return Some(Screen::Home(Home::default()));
                 }
                 Err(error) => shared.error(error),
@@ -334,24 +338,6 @@ impl Import {
         }
         back_pressed(ui).then_some(Screen::Start)
     }
-}
-
-/// The `.txt` files in `dirs`, where the signer saves descriptors.
-fn descriptor_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = (dirs.iter())
-        .filter_map(|dir| std::fs::read_dir(dir).ok())
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "txt"))
-        .filter(|path| {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            let text = text.trim_start();
-            text.starts_with("wpkh(") || text.starts_with("tr(")
-        })
-        .collect();
-    files.sort();
-    files
 }
 
 /// A payment: the node funds it as a PSBT for the review screen.
@@ -373,7 +359,10 @@ impl Pay {
         if let Some(created) = self.creating.as_ref().and_then(Task::poll) {
             self.creating = None;
             match created {
-                Ok(psbt) => return Some(Screen::Review(Review::new(psbt, Origin::Node, shared))),
+                Ok(psbt) => {
+                    let review = Review::new(psbt, Origin::Node, Which::Account, shared);
+                    return Some(Screen::Review(review));
+                }
                 Err(error) => shared.error(error),
             }
         }

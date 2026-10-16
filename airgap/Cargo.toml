@@ -9,6 +9,7 @@ qrcode.workspace = true
 thiserror.workspace = true
 ur.workspace = true
 wallet-core.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rqrr.workspace = true

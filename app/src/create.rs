@@ -12,6 +12,7 @@ use wallet_core::seed::Seed;
 use zeroize::Zeroizing;
 
 use crate::app::{Screen, Shared, Wallet};
+use crate::backup::Backup;
 use crate::theme::{ACCENT, DIM, FAINT, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
     Control, Emphasis, Hint, Keyboard, Keys, Press, back_pressed, button, button_row, card,
@@ -62,9 +63,9 @@ struct Question {
 }
 
 /// Words shown at once: as many as a handheld's screen fits legibly.
-const PAGE: usize = 12;
-/// Words asked back.
-const CHECKS: usize = 3;
+pub(crate) const PAGE: usize = 12;
+/// Words asked back: one of each group of this many, as Jade asks.
+const GROUP: usize = 3;
 
 impl Generate {
     pub fn title(&self) -> String {
@@ -239,7 +240,8 @@ impl Generate {
                     ui.with_layout(
                         eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                         |ui| {
-                            text(ui, format!("{} of {CHECKS}", *asked + 1), body(12.5), DIM);
+                            let total = questions.len();
+                            text(ui, format!("{} of {total}", *asked + 1), body(12.5), DIM);
                         },
                     );
                 });
@@ -313,21 +315,26 @@ fn new_mnemonic(bytes: usize) -> Result<Mnemonic, String> {
     Mnemonic::from_entropy(&entropy[..bytes]).map_err(|error| error.to_string())
 }
 
-/// `CHECKS` different positions, each with the word there and three others of the word list,
-/// in a random order.
+/// A position in each group of `GROUP` words, each with the word there and three others in a
+/// random order. The others are the seed's own words where it has enough, as Jade picks them: a
+/// word from the whole list is easy to rule out as one never written down.
 fn questions(words: &[&str]) -> Vec<Question> {
     let list = wallet_core::bip39::Language::English.word_list();
-    let mut positions: Vec<usize> = (0..words.len()).collect();
-    shuffle(&mut positions);
-    positions.truncate(CHECKS);
-    positions.sort();
-    (positions.into_iter())
-        .map(|position| {
-            let right =
-                list.iter().copied().find(|word| *word == words[position]).expect("a listed word");
+    let listed = |word: &str| list.iter().copied().find(|listed| *listed == word).expect("listed");
+    (0..words.len().div_ceil(GROUP))
+        .map(|group| {
+            let start = group * GROUP;
+            let position = start + random_below(GROUP.min(words.len() - start));
+            let right = listed(words[position]);
             let mut choices = vec![right];
-            while choices.len() < 4 {
-                let other = list[random_below(list.len())];
+            let mut others: Vec<&'static str> = words.iter().map(|word| listed(word)).collect();
+            shuffle(&mut others);
+            for other in
+                others.into_iter().chain(std::iter::repeat_with(|| list[random_below(list.len())]))
+            {
+                if choices.len() == 4 {
+                    break;
+                }
                 if !choices.contains(&other) {
                     choices.push(other);
                 }
@@ -350,7 +357,7 @@ fn shuffle<T>(items: &mut [T]) {
 }
 
 /// `words` from `from`, a page of them, numbered and in columns read top to bottom.
-fn word_grid(ui: &mut Ui, words: &[&str], from: usize) {
+pub(crate) fn word_grid(ui: &mut Ui, words: &[&str], from: usize) {
     let page = &words[from..(from + PAGE).min(words.len())];
     let rows = page.len().div_ceil(3);
     card(ui, |ui| {
@@ -379,6 +386,8 @@ pub struct Restore {
     words: Vec<&'static str>,
     prefix: String,
     keyboard: Keyboard,
+    /// The seed a copy of whose words is being checked, rather than restored.
+    check: Option<Mnemonic>,
 }
 
 /// Words entered at once, as the restore screen's line of them shows.
@@ -387,10 +396,17 @@ const SHOWN: usize = 3;
 const CANDIDATES: usize = 5;
 
 impl Restore {
+    /// Checks a copy of `mnemonic`'s words: they are typed in as they are restored, and compared
+    /// with the seed's word by word.
+    pub fn check(mnemonic: Mnemonic) -> Restore {
+        Restore { count: Some(mnemonic.word_count()), check: Some(mnemonic), ..Restore::default() }
+    }
+
     pub fn title(&self) -> String {
-        match self.count {
-            None => "Restore".to_owned(),
-            Some(count) => format!("Word {} of {count}", self.words.len() + 1),
+        match (self.count, &self.check) {
+            (None, _) => "Restore".to_owned(),
+            (Some(count), None) => format!("Word {} of {count}", self.words.len() + 1),
+            (Some(count), Some(_)) => format!("Check word {} of {count}", self.words.len() + 1),
         }
     }
 
@@ -484,6 +500,23 @@ impl Restore {
             self.words.push(word);
             self.prefix.clear();
             shared.refocus();
+            if let (true, Some(seed)) = (self.words.len() == count, &self.check) {
+                // Word by word: a copy whose words are a valid seed of their own can still
+                // be wrong.
+                let wrong: Vec<String> = (seed.words().zip(&self.words).enumerate())
+                    .filter(|(_, (right, copied))| right != *copied)
+                    .map(|(index, _)| (index + 1).to_string())
+                    .collect();
+                match wrong.len() {
+                    0 => shared.info("Your copy matches the seed, word for word."),
+                    1 => shared.error(format!("Word {} of your copy is not the seed's.", wrong[0])),
+                    _ => shared.error(format!(
+                        "Words {} of your copy are not the seed's.",
+                        wrong.join(", ")
+                    )),
+                }
+                return Some(Screen::Backup(Backup));
+            }
             if self.words.len() == count {
                 match Mnemonic::parse_in_normalized(english, &self.words.join(" ")) {
                     Ok(mnemonic) => return Some(Screen::Setup(Setup::new(mnemonic, true))),
@@ -495,6 +528,9 @@ impl Restore {
             if !self.prefix.is_empty() {
                 self.prefix.clear();
             } else if self.words.pop().is_none() {
+                if self.check.is_some() {
+                    return Some(Screen::Backup(Backup));
+                }
                 self.count = None;
             }
             shared.refocus();
@@ -608,7 +644,7 @@ impl Setup {
                     shared.online.open(ui.ctx(), &account, self.restored.then_some(0));
                     #[cfg(not(feature = "online"))]
                     let _ = self.restored;
-                    shared.wallet = Some(Wallet { seed: Some(seed), account });
+                    shared.wallet = Some(Wallet::signing(self.mnemonic.clone(), seed, account));
                     return Some(Screen::Home(Default::default()));
                 }
                 Err(error) => shared.error(error),

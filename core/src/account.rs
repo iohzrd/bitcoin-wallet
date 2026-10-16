@@ -13,6 +13,7 @@ use miniscript::descriptor::{
     Wildcard,
 };
 
+use crate::policy::{Policy, Spend};
 use crate::seed::Seed;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +28,10 @@ pub enum Error {
     UnsupportedKey,
     #[error("the xpub is for {xpub:?} but the wallet is on {network}")]
     NetworkMismatch { xpub: NetworkKind, network: Network },
+    #[error(
+        "two descriptors must be one account's receive and change, the same but for /0/* and /1/*"
+    )]
+    NotKeychains,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -139,7 +144,7 @@ impl Account {
     /// path is not checked against BIP84's or BIP86's: an account another wallet made at a path
     /// of its own still derives and signs the same way.
     pub fn from_descriptor(descriptor: &str, network: Network) -> Result<Account, Error> {
-        Account::from_parsed(descriptor.parse()?, network)
+        Account::from_parsed(parse_keychains(descriptor)?, network)
     }
 
     fn from_parsed(
@@ -151,22 +156,7 @@ impl Account {
             Descriptor::Tr(tr) if tr.tap_tree().is_none() => (Kind::Taproot, tr.internal_key()),
             _ => return Err(Error::UnsupportedScript),
         };
-        let DescriptorPublicKey::MultiXPub(DescriptorMultiXKey {
-            origin: Some(origin),
-            xkey,
-            derivation_paths,
-            wildcard: Wildcard::Unhardened,
-        }) = key
-        else {
-            return Err(Error::UnsupportedKey);
-        };
-        if *derivation_paths != receive_and_change() {
-            return Err(Error::UnsupportedKey);
-        }
-        if xkey.network != NetworkKind::from(network) {
-            return Err(Error::NetworkMismatch { xpub: xkey.network, network });
-        }
-        let (origin, xpub) = (origin.clone(), *xkey);
+        let (origin, xpub) = account_key(key, network)?;
         let keychains = descriptor.clone().into_single_descriptors()?;
         let keychains = keychains.try_into().expect("<0;1> makes two descriptors");
         Ok(Account { network, kind, origin, xpub, descriptor, keychains })
@@ -291,6 +281,116 @@ impl Account {
     }
 }
 
+/// The descriptor `text` holds: one with `<0;1>` for its receive and change keychains, or, as
+/// Bitcoin Core's `listdescriptors` and wallets that predate multipath descriptors write an
+/// account, two on lines of their own, one ending its keys in `/0/*` and the other the same but
+/// for `/1/*`, which this makes the one.
+pub(crate) fn parse_keychains(text: &str) -> Result<Descriptor<DescriptorPublicKey>, Error> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let (receive, change) = match lines[..] {
+        [one] => return Ok(one.parse()?),
+        [first, second] => (first, second),
+        _ => return Err(Error::NotKeychains),
+    };
+    // Each parsed alone first, so its checksum is checked before the rewriting drops it.
+    for line in [receive, change] {
+        line.parse::<Descriptor<DescriptorPublicKey>>()?;
+    }
+    let bare = |line: &str| line.split('#').next().unwrap_or_default().to_owned();
+    let (first, second) = (bare(receive), bare(change));
+    let receive = [(&first, &second), (&second, &first)]
+        .into_iter()
+        .find(|(receive, change)| {
+            receive.contains("/0/*") && receive.replace("/0/*", "/1/*") == **change
+        })
+        .map(|(receive, _)| receive)
+        .ok_or(Error::NotKeychains)?;
+    Ok(receive.replace("/0/*", "/<0;1>/*").parse()?)
+}
+
+/// The origin and xpub of an account's key in a descriptor: an xpub with its origin, ending in
+/// `/<0;1>/*` for the receive and change keychains, on `network`.
+pub(crate) fn account_key(
+    key: &DescriptorPublicKey,
+    network: Network,
+) -> Result<(KeySource, Xpub), Error> {
+    let DescriptorPublicKey::MultiXPub(DescriptorMultiXKey {
+        origin: Some(origin),
+        xkey,
+        derivation_paths,
+        wildcard: Wildcard::Unhardened,
+    }) = key
+    else {
+        return Err(Error::UnsupportedKey);
+    };
+    if *derivation_paths != receive_and_change() {
+        return Err(Error::UnsupportedKey);
+    }
+    if xkey.network != NetworkKind::from(network) {
+        return Err(Error::NetworkMismatch { xpub: xkey.network, network });
+    }
+    Ok((origin.clone(), *xkey))
+}
+
+impl Policy for Account {
+    fn network(&self) -> Network {
+        self.network
+    }
+
+    fn script_pubkey(&self, derivation: Derivation) -> ScriptBuf {
+        Account::script_pubkey(self, derivation)
+    }
+
+    fn address(&self, derivation: Derivation) -> Address {
+        Account::address(self, derivation)
+    }
+
+    fn derivation_of(&self, source: &KeySource, script_pubkey: &Script) -> Option<Derivation> {
+        Account::derivation_of(self, source, script_pubkey)
+    }
+
+    fn claims(&self, source: &KeySource) -> bool {
+        is_keychain_path(source, &self.origin)
+    }
+
+    fn spend(&self, _: Derivation) -> Spend {
+        match self.kind {
+            Kind::SegwitV0 => Spend::SegwitV0Key,
+            Kind::Taproot => Spend::TaprootKey,
+        }
+    }
+
+    fn threshold(&self) -> usize {
+        1
+    }
+
+    fn max_satisfaction_weight(&self) -> Weight {
+        Account::max_satisfaction_weight(self)
+    }
+
+    fn signer(&self) -> Option<(&KeySource, &Xpub)> {
+        Some((&self.origin, &self.xpub))
+    }
+
+    fn annotate_input(&self, input: &mut psbt::Input, derivation: Derivation) {
+        Account::annotate_input(self, input, derivation);
+    }
+
+    fn annotate_output(&self, output: &mut psbt::Output, derivation: Derivation) {
+        Account::annotate_output(self, output, derivation);
+    }
+}
+
+/// Whether `source` names the key at `origin` on its receive or change branch: the same master
+/// fingerprint, and the origin's path followed by 0 or 1 and an index.
+pub(crate) fn is_keychain_path(source: &KeySource, origin: &KeySource) -> bool {
+    let ((fingerprint, path), (key_fingerprint, key_path)) = (source, origin);
+    fingerprint == key_fingerprint
+        && path.as_ref().strip_prefix(key_path.as_ref()).is_some_and(|rest| {
+            matches!(rest, [ChildNumber::Normal { index: 0 | 1 }, ChildNumber::Normal { .. }])
+        })
+}
+
 /// `<0;1>`: the receive and change branches.
 fn receive_and_change() -> DerivPaths {
     let branch =
@@ -393,6 +493,22 @@ mod tests {
             let unchecked = exported.split('#').next().unwrap();
             assert_eq!(Account::from_descriptor(unchecked, Network::Signet).unwrap(), account);
         }
+    }
+
+    #[test]
+    fn an_account_reads_as_its_two_keychains_as_bitcoin_core_lists_them() {
+        let account = Account::from_seed(&abandon(""), Network::Regtest, Kind::Taproot, 0).unwrap();
+        let receive = account.keychain_descriptor(Keychain::Receive).to_string();
+        let change = account.keychain_descriptor(Keychain::Change).to_string();
+        for pair in [format!("{receive}\n{change}"), format!("{change}\n\n{receive}\n")] {
+            assert_eq!(Account::from_descriptor(&pair, Network::Regtest).unwrap(), account);
+        }
+        let other = Account::from_seed(&abandon("x"), Network::Regtest, Kind::Taproot, 0).unwrap();
+        let mismatched = format!("{receive}\n{}", other.keychain_descriptor(Keychain::Change));
+        let refused = Account::from_descriptor(&mismatched, Network::Regtest);
+        assert!(matches!(refused, Err(Error::NotKeychains)));
+        let mangled = format!("{receive}\n{}", change.replace('#', "#x"));
+        assert!(Account::from_descriptor(&mangled, Network::Regtest).is_err(), "a bad checksum");
     }
 
     #[test]

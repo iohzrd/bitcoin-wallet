@@ -4,6 +4,8 @@
 //! on a handheld with a D-pad.
 
 mod app;
+mod backup;
+mod cosign;
 mod create;
 mod files;
 mod gamepad;

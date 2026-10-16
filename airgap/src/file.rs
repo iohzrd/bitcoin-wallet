@@ -42,6 +42,22 @@ pub fn write_psbt(psbt: &Psbt) -> Vec<u8> {
     psbt.serialize()
 }
 
+/// What a signer sends back: the transaction and each input's signatures, and nothing else, which
+/// the coordinator combines with the PSBT it sent. SeedSigner returns its QR codes so; dropping
+/// the previous transactions and derivations makes the loop a fraction as long.
+pub fn signatures_only(psbt: &Psbt) -> Psbt {
+    let mut trimmed = Psbt::from_unsigned_tx(psbt.unsigned_tx.clone()).expect("an unsigned tx");
+    trimmed.version = psbt.version;
+    for (trimmed, input) in trimmed.inputs.iter_mut().zip(&psbt.inputs) {
+        trimmed.partial_sigs = input.partial_sigs.clone();
+        trimmed.tap_key_sig = input.tap_key_sig;
+        trimmed.tap_script_sigs = input.tap_script_sigs.clone();
+        trimmed.final_script_sig = input.final_script_sig.clone();
+        trimmed.final_script_witness = input.final_script_witness.clone();
+    }
+    trimmed
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -64,6 +80,25 @@ pub(crate) mod tests {
         assert_eq!(read_psbt(base64.as_bytes()).unwrap(), psbt);
         let hex = format!("{}\r\n", EXAMPLE.to_uppercase());
         assert_eq!(read_psbt(hex.as_bytes()).unwrap(), psbt);
+    }
+
+    #[test]
+    fn signatures_alone_combine_back_into_the_signed_psbt() {
+        let unsigned = example();
+        let mut signed = unsigned.clone();
+        // Combining copies signatures without checking them, so any key and signature serve.
+        let key = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
+        let key: wallet_core::bitcoin::secp256k1::PublicKey = key.parse().unwrap();
+        let signature = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
+        let signature = wallet_core::bitcoin::ecdsa::Signature::from_slice(&signature).unwrap();
+        signed.inputs[0].partial_sigs.insert(wallet_core::bitcoin::PublicKey::new(key), signature);
+        signed.inputs[0].witness_utxo = Some(wallet_core::bitcoin::TxOut::NULL);
+        let trimmed = signatures_only(&signed);
+        assert!(trimmed.serialize().len() < signed.serialize().len());
+        assert!(trimmed.inputs[0].witness_utxo.is_none());
+        let mut combined = unsigned;
+        combined.combine(trimmed).unwrap();
+        assert_eq!(combined.inputs[0].partial_sigs, signed.inputs[0].partial_sigs);
     }
 
     #[test]

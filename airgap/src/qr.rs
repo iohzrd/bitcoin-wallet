@@ -20,8 +20,20 @@ impl Qr {
     /// capitals) and byte mode where it cannot (a descriptor).
     pub fn new(text: &str) -> Result<Qr, TooLong> {
         let code = QrCode::with_error_correction_level(text, EcLevel::M).map_err(|_| TooLong)?;
+        Ok(Qr::from_code(&code))
+    }
+
+    /// A QR code for one part of a loop, at error correction level L, as SeedSigner, Jade and
+    /// Krux show theirs: a smaller code reads more easily, and a part the camera misses comes
+    /// round again.
+    pub fn for_loop(text: &str) -> Result<Qr, TooLong> {
+        let code = QrCode::with_error_correction_level(text, EcLevel::L).map_err(|_| TooLong)?;
+        Ok(Qr::from_code(&code))
+    }
+
+    pub(crate) fn from_code(code: &QrCode) -> Qr {
         let dark = code.to_colors().into_iter().map(|color| color == Color::Dark).collect();
-        Ok(Qr { width: code.width(), dark })
+        Qr { width: code.width(), dark }
     }
 
     /// The modules a side.
@@ -38,7 +50,7 @@ impl Qr {
 pub const QUIET_ZONE: usize = 4;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bcur::{FRAGMENT_LEN, PsbtDecoder, PsbtEncoder};
     use crate::file::tests::example;
@@ -46,6 +58,11 @@ mod tests {
 
     /// What a camera reads off `qr` drawn `scale` pixels a module with its quiet zone.
     fn scan(qr: &Qr, scale: usize) -> String {
+        String::from_utf8(scan_bytes(qr, scale)).unwrap()
+    }
+
+    /// The bytes a camera reads off `qr`, which need not be text.
+    pub(crate) fn scan_bytes(qr: &Qr, scale: usize) -> Vec<u8> {
         let side = (qr.width() + 2 * QUIET_ZONE) * scale;
         let mut image = rqrr::PreparedImage::prepare_from_greyscale(side, side, |x, y| {
             let (x, y) = (x / scale, y / scale);
@@ -57,7 +74,9 @@ mod tests {
         });
         let grids = image.detect_grids();
         assert_eq!(grids.len(), 1);
-        grids[0].decode().unwrap().1
+        let mut bytes = Vec::new();
+        grids[0].decode_to(&mut bytes).unwrap();
+        bytes
     }
 
     #[test]

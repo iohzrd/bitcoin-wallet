@@ -14,6 +14,9 @@ use wallet_core::bitcoin::psbt::Psbt;
 use wallet_core::bitcoin::secp256k1::Secp256k1;
 use wallet_core::bitcoin::transaction::Version;
 use wallet_core::bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid};
+use wallet_core::multisig::{CosignerKey, Multisig};
+use wallet_core::policy::Policy;
+use wallet_core::psbt::review;
 use wallet_core::seed::Seed;
 
 use crate::app::{App, Config, Screen, Wallet};
@@ -69,9 +72,25 @@ fn shown(harness: &Harness<App>, text: &str) {
 }
 
 fn abandon() -> Wallet {
-    let seed = Seed::new(&Mnemonic::parse(ABANDON).unwrap(), "");
+    abandon_with("")
+}
+
+/// The abandon mnemonic's wallet under `passphrase`.
+fn abandon_with(passphrase: &str) -> Wallet {
+    let seed = Seed::new(&Mnemonic::parse(ABANDON).unwrap(), passphrase);
     let account = Account::from_seed(&seed, Network::Regtest, Kind::Taproot, 0).unwrap();
-    Wallet { seed: Some(seed), account }
+    Wallet::signing(Mnemonic::parse(ABANDON).unwrap(), seed, account)
+}
+
+/// A 2-of-3 of three passphrases' keys, the first the abandon wallet's own.
+fn two_of_three() -> String {
+    let keys: Vec<String> = (["", "TREZOR", "a third"].iter())
+        .map(|passphrase| {
+            let seed = Seed::new(&Mnemonic::parse(ABANDON).unwrap(), passphrase);
+            format!("{}/<0;1>/*", CosignerKey::new(&seed, Network::Regtest, 0).unwrap())
+        })
+        .collect();
+    format!("wsh(sortedmulti(2,{}))", keys.join(","))
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -81,9 +100,9 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// A PSBT spending 50,000 sat of the account's to someone else, with change, as a coordinator
+/// A PSBT spending 50,000 sat of the policy's to someone else, with change, as a coordinator
 /// writes one.
-fn payment(account: &Account) -> Psbt {
+fn payment(account: &dyn Policy) -> Psbt {
     let funding = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -134,14 +153,18 @@ fn a_new_seed_is_made_written_down_checked_and_opened_with_the_gamepad_alone() {
     let words = generate.shown_words().unwrap();
     assert_eq!(words.len(), 12);
     press(&mut harness, Key::Enter); // I wrote them down
-    for _ in 0..3 {
-        let Screen::Generate(generate) = harness.state().screen() else { panic!("not checking") };
-        let (right, choices) = generate.question().unwrap();
+    // One word of each three, among others of the seed's own.
+    let mut asked = 0;
+    while let Screen::Generate(generate) = harness.state().screen() {
+        let (right, choices) = generate.question().expect("a question");
+        assert!(choices.iter().all(|choice| words.contains(choice)), "{choices:?}");
         for _ in 0..choices.iter().position(|choice| *choice == right).unwrap() {
             press(&mut harness, Key::ArrowDown);
         }
         press(&mut harness, Key::Enter);
+        asked += 1;
     }
+    assert_eq!(asked, 4);
     assert!(matches!(harness.state().screen(), Screen::Setup(_)));
     press(&mut harness, Key::Enter); // Open
     assert!(matches!(harness.state().screen(), Screen::Home(_)));
@@ -298,6 +321,208 @@ fn every_screen_past_the_first_goes_back_without_escape_or_b() {
     assert!(back.is_none(), "home has nowhere to go back to");
 }
 
+#[test]
+fn b_cancels_a_review_from_anywhere_on_it() {
+    let dir = temp_dir("cancel");
+    let wallet = abandon();
+    std::fs::write(dir.join("pay.psbt"), payment(&wallet.account).serialize()).unwrap();
+    let mut app = app(vec![dir.clone()]);
+    app.open(wallet);
+    let mut harness = harness(app);
+    press(&mut harness, Key::Enter); // Sign
+    press(&mut harness, Key::Enter); // pay.psbt
+    press(&mut harness, Key::ArrowDown);
+    assert!(matches!(harness.state().screen(), Screen::Review(_)));
+    press(&mut harness, Key::Escape);
+    assert!(matches!(harness.state().screen(), Screen::Home(_)), "B cancels");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_backup_shows_the_words_checks_a_copy_and_draws_its_seedqr() {
+    let mut app = app(Vec::new());
+    app.open(abandon());
+    let mut harness = harness(app);
+    for _ in 0..3 {
+        press(&mut harness, Key::ArrowDown);
+    }
+    press(&mut harness, Key::Enter); // Backup
+    assert!(matches!(harness.state().screen(), Screen::Backup(_)));
+
+    press(&mut harness, Key::Enter); // Show the words
+    shown(&harness, "about");
+    press(&mut harness, Key::Enter); // Done
+    assert!(matches!(harness.state().screen(), Screen::Backup(_)));
+
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::Enter); // Check a copy
+    type_text(&mut harness, &"aba".repeat(11));
+    type_text(&mut harness, "abou");
+    assert!(matches!(harness.state().screen(), Screen::Backup(_)));
+    shown(&harness, "Your copy matches the seed");
+
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::Enter);
+    // "ability" where the seed has "abandon".
+    type_text(&mut harness, "abi");
+    type_text(&mut harness, &"aba".repeat(10));
+    type_text(&mut harness, "abou");
+    shown(&harness, "Word 1 of your copy is not the seed's");
+
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::Enter); // SeedQR
+    shown(&harness, "21 × 21");
+    harness.get_by_label("Standard SeedQR").click();
+    harness.run();
+    shown(&harness, "25 × 25");
+}
+
+#[test]
+fn a_multisig_registers_from_the_card_and_its_psbt_takes_two_signers() {
+    let dir = temp_dir("multisig");
+    let descriptor = two_of_three();
+    std::fs::write(dir.join("vault.txt"), &descriptor).unwrap();
+    let watching = Multisig::from_descriptor(&descriptor, Network::Regtest).unwrap();
+    std::fs::write(dir.join("pay.psbt"), payment(&watching).serialize()).unwrap();
+
+    let sign_as = |passphrase: &str, file: &str| {
+        let mut app = app(vec![dir.clone()]);
+        app.open(abandon_with(passphrase));
+        let mut harness = harness(app);
+        for _ in 0..4 {
+            press(&mut harness, Key::ArrowDown);
+        }
+        press(&mut harness, Key::Enter); // Multisig
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::Enter); // Register a wallet
+        press(&mut harness, Key::Enter); // vault.txt
+        assert!(matches!(harness.state().screen(), Screen::MultisigWallet(_)));
+        shown(&harness, "2 of 3 signatures");
+        press(&mut harness, Key::Enter); // Sign
+        harness.get_by_label(file).click();
+        harness.run();
+        assert!(matches!(harness.state().screen(), Screen::Review(_)));
+        shown(&harness, "Change #0");
+        for _ in 0..10 {
+            if harness.get_by_label("Sign").is_focused() {
+                break;
+            }
+            press(&mut harness, Key::ArrowDown);
+        }
+        press(&mut harness, Key::Enter);
+        assert!(matches!(harness.state().screen(), Screen::Outgoing(_)));
+        harness
+    };
+
+    let first = sign_as("", "pay.psbt");
+    shown(&first, "1 OF 2 SIGNATURES");
+    drop(first);
+    let second = sign_as("a third", "pay-signed.psbt");
+    shown(&second, "SIGNED");
+
+    let signed = std::fs::read(dir.join("pay-signed-signed.psbt")).unwrap();
+    let mut signed = wallet_airgap::file::read_psbt(&signed).unwrap();
+    assert!(review(&watching, &signed).unwrap().complete());
+    use wallet_core::miniscript::psbt::PsbtExt;
+    signed.finalize_mut(&Secp256k1::verification_only()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Opens the abandon wallet and goes to Multisig, then Register a wallet.
+fn registering(dir: &std::path::Path) -> Harness<'static, App> {
+    let mut app = app(vec![dir.to_path_buf()]);
+    app.open(abandon());
+    let mut harness = harness(app);
+    for _ in 0..4 {
+        press(&mut harness, Key::ArrowDown);
+    }
+    press(&mut harness, Key::Enter); // Multisig
+    press(&mut harness, Key::ArrowDown);
+    press(&mut harness, Key::Enter); // Register a wallet
+    harness
+}
+
+#[test]
+fn a_wallet_registers_from_sparrows_descriptor_export_and_from_bsms() {
+    let dir = temp_dir("sparrow");
+    let descriptor = two_of_three();
+    let watching = Multisig::from_descriptor(&descriptor, Network::Regtest).unwrap();
+    // As Sparrow writes it, with its annotations, which the checksum covers.
+    let annotated = format!("{descriptor}?bh=850123");
+    let mut engine = wallet_core::miniscript::descriptor::checksum::Engine::new();
+    engine.input(&annotated).unwrap();
+    let sparrow = format!("# Receive and change descriptor:\n{annotated}#{}\n", engine.checksum());
+    std::fs::write(dir.join("Vault.txt"), &sparrow).unwrap();
+    let mut harness = registering(&dir);
+    press(&mut harness, Key::Enter); // Vault.txt
+    assert!(matches!(harness.state().screen(), Screen::MultisigWallet(_)));
+    let first = watching.address(Derivation::receive(0)).to_string();
+    shown(&harness, &crate::widgets::grouped(&first)[..14]);
+    drop(harness);
+
+    // A BSMS record whose first address is not the wallet's is refused.
+    std::fs::remove_file(dir.join("Vault.txt")).unwrap();
+    let bsms = |address: &str| format!("BSMS 1.0\n{descriptor}\n/0/*,/1/*\n{address}\n");
+    std::fs::write(dir.join("vault.bsms"), bsms("bcrt1qnotthewallets")).unwrap();
+    let mut harness = registering(&dir);
+    press(&mut harness, Key::Enter);
+    assert!(matches!(harness.state().screen(), Screen::Register(_)));
+    shown(&harness, "is not the wallet's");
+    drop(harness);
+    std::fs::write(dir.join("vault.bsms"), bsms(&first)).unwrap();
+    let mut harness = registering(&dir);
+    press(&mut harness, Key::Enter);
+    assert!(matches!(harness.state().screen(), Screen::MultisigWallet(_)));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_psbt_with_warnings_takes_a_second_press_to_sign() {
+    let dir = temp_dir("warned");
+    let wallet = abandon();
+    let mut psbt = payment(&wallet.account);
+    // A fee of 6% of the coin: change cut from 9,000 to 6,000 sat.
+    psbt.unsigned_tx.output[1].value = Amount::from_sat(6_000);
+    std::fs::write(dir.join("pay.psbt"), psbt.serialize()).unwrap();
+    let mut app = app(vec![dir.clone()]);
+    app.open(wallet);
+    let mut harness = harness(app);
+    press(&mut harness, Key::Enter); // Sign
+    press(&mut harness, Key::Enter); // pay.psbt
+    shown(&harness, "That is a lot");
+    for _ in 0..10 {
+        if harness.get_by_label("Sign").is_focused() {
+            break;
+        }
+        press(&mut harness, Key::ArrowDown);
+    }
+    press(&mut harness, Key::Enter);
+    assert!(matches!(harness.state().screen(), Screen::Review(_)), "not yet");
+    assert!(harness.get_by_label("Sign anyway").is_focused());
+    press(&mut harness, Key::Enter);
+    assert!(matches!(harness.state().screen(), Screen::Outgoing(_)));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_multisig_key_saves_to_the_card_for_a_coordinator() {
+    let dir = temp_dir("cosigner");
+    let mut app = app(vec![dir.clone()]);
+    app.open(abandon());
+    let mut harness = harness(app);
+    for _ in 0..4 {
+        press(&mut harness, Key::ArrowDown);
+    }
+    press(&mut harness, Key::Enter); // Multisig
+    press(&mut harness, Key::Enter); // Your key
+    assert!(matches!(harness.state().screen(), Screen::CosignerKey(_)));
+    press(&mut harness, Key::Enter); // Save
+    let saved = std::fs::read_to_string(dir.join("73c5da0a-multisig-key.txt")).unwrap();
+    assert!(saved.starts_with("[73c5da0a/48'/1'/0'/2']tpub"), "{saved}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Renders the screens to `target/screenshots`, on a handheld's 640 by 480 and a desktop window.
 #[test]
 #[ignore = "renders with wgpu; run by hand to look at the screens"]
@@ -309,6 +534,15 @@ fn screenshots() {
         let dir = temp_dir(&format!("shots-{device}"));
         let wallet = abandon();
         std::fs::write(dir.join("pay.psbt"), payment(&wallet.account).serialize()).unwrap();
+        let vault = two_of_three();
+        std::fs::write(dir.join("vault.txt"), &vault).unwrap();
+        let watching = Multisig::from_descriptor(&vault, Network::Regtest).unwrap();
+        std::fs::write(dir.join("vault.psbt"), payment(&watching).serialize()).unwrap();
+        let mut warned = payment(&wallet.account);
+        warned.unsigned_tx.output[1].value = Amount::from_sat(6_000);
+        warned.unsigned_tx.lock_time =
+            wallet_core::bitcoin::absolute::LockTime::from_height(850_000).unwrap();
+        std::fs::write(dir.join("warned.psbt"), warned.serialize()).unwrap();
         let mut harness = Harness::builder()
             .with_size(size)
             .with_max_steps(32)
@@ -362,7 +596,8 @@ fn screenshots() {
         shot(&mut harness, "09-home");
         press(&mut harness, Key::Enter);
         shot(&mut harness, "10-files");
-        press(&mut harness, Key::Enter);
+        harness.get_by_label("pay.psbt").click();
+        harness.run();
         shot(&mut harness, "11-review");
         for _ in 0..10 {
             if harness.get_by_label("Sign").is_focused() {
@@ -385,6 +620,51 @@ fn screenshots() {
         press(&mut harness, Key::Enter); // Addresses
         press(&mut harness, Key::PageDown);
         shot(&mut harness, "16-addresses");
+        press(&mut harness, Key::Escape);
+        for _ in 0..3 {
+            press(&mut harness, Key::ArrowDown);
+        }
+        press(&mut harness, Key::Enter); // Backup
+        shot(&mut harness, "17-backup");
+        press(&mut harness, Key::Enter); // Show the words
+        shot(&mut harness, "18-backup-words");
+        press(&mut harness, Key::Escape);
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::Enter); // SeedQR
+        shot(&mut harness, "19-seedqr");
+        press(&mut harness, Key::Escape);
+        press(&mut harness, Key::Escape);
+        for _ in 0..4 {
+            press(&mut harness, Key::ArrowDown);
+        }
+        press(&mut harness, Key::Enter); // Multisig
+        shot(&mut harness, "20-multisig");
+        press(&mut harness, Key::Enter); // Your key
+        shot(&mut harness, "21-multisig-key");
+        press(&mut harness, Key::Escape);
+        press(&mut harness, Key::ArrowDown);
+        press(&mut harness, Key::Enter); // Register a wallet
+        shot(&mut harness, "22-register");
+        press(&mut harness, Key::Enter); // vault.txt
+        shot(&mut harness, "23-multisig-wallet");
+        press(&mut harness, Key::Enter); // Sign
+        harness.get_by_label("vault.psbt").click();
+        harness.run();
+        for _ in 0..5 {
+            press(&mut harness, Key::ArrowDown);
+        }
+        shot(&mut harness, "24-multisig-review");
+        for _ in 0..3 {
+            press(&mut harness, Key::Escape);
+        }
+        press(&mut harness, Key::Enter); // Sign
+        harness.get_by_label("warned.psbt").click();
+        harness.run();
+        for _ in 0..4 {
+            press(&mut harness, Key::ArrowDown);
+        }
+        shot(&mut harness, "25-review-warnings");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

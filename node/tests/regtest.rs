@@ -6,10 +6,14 @@
 
 use std::str::FromStr;
 
+use serde_json::json;
+
 use wallet_core::Mnemonic;
 use wallet_core::account::{Account, Derivation, Keychain, Kind};
 use wallet_core::bitcoin::psbt::Psbt;
 use wallet_core::bitcoin::{Address, Amount, Network, SignedAmount};
+use wallet_core::multisig::{CosignerKey, Multisig};
+use wallet_core::policy::Policy;
 use wallet_core::psbt;
 use wallet_core::seed::Seed;
 use wallet_node::regtest::Regtest;
@@ -112,4 +116,75 @@ fn a_wrong_login_is_an_http_error() {
     let wrong = Auth::UserPass { user: "nobody".into(), password: "wrong".into() };
     let refused = Node::new(format!("http://127.0.0.1:{}", regtest.port), wrong).network();
     assert!(matches!(refused, Err(wallet_node::Error::Status { status: 401, .. })), "{refused:?}");
+}
+
+#[test]
+#[ignore = "needs BITCOIND"]
+fn a_two_of_three_the_node_funds_is_signed_by_two_seeds() {
+    let regtest = Regtest::start("multisig");
+    let node = &regtest.node;
+    let seeds = ["", "TREZOR", "a third"].map(seed);
+    let keys: Vec<String> = (seeds.iter())
+        .map(|seed| format!("{}/<0;1>/*", CosignerKey::new(seed, Network::Regtest, 0).unwrap()))
+        .collect();
+    let descriptor = format!("wsh(sortedmulti(2,{}))", keys.join(","));
+    let watching = Multisig::from_descriptor(&descriptor, Network::Regtest).unwrap();
+    let cosigner = |index: usize| watching.clone().with_seed(&seeds[index]).unwrap();
+
+    // The node watches the wallet as a coordinator does, with no keys of its own.
+    let options = json!({ "wallet_name": "multisig", "disable_private_keys": true, "blank": true });
+    node.call("createwallet", options).unwrap();
+    let imports: Vec<_> = [Keychain::Receive, Keychain::Change]
+        .map(|keychain| {
+            json!({
+                "desc": watching.keychain_descriptor(keychain).to_string(),
+                "active": true,
+                "internal": keychain == Keychain::Change,
+                "timestamp": "now",
+            })
+        })
+        .into();
+    let imported = node.call_wallet("multisig", "importdescriptors", json!([imports])).unwrap();
+    assert!(
+        imported.as_array().unwrap().iter().all(|result| result["success"] == true),
+        "{imported}"
+    );
+    let address = node.call_wallet("multisig", "getnewaddress", json!(["", "bech32"])).unwrap();
+    assert_eq!(address, watching.address(Derivation::receive(0)).to_string(), "the signer's");
+
+    regtest.mine(101, &watching.address(Derivation::receive(0)));
+    let payee = elsewhere(Kind::Taproot).to_string();
+    let outputs = json!([{ payee.clone(): "1" }]);
+    let options = json!({ "fee_rate": 2, "change_type": "bech32" });
+    let funded = node.call_wallet(
+        "multisig",
+        "walletcreatefundedpsbt",
+        json!([[], outputs, 0, options, true]),
+    );
+    let mut psbt = Psbt::from_str(funded.unwrap()["psbt"].as_str().unwrap()).unwrap();
+
+    let review = psbt::review(&cosigner(0), &psbt).unwrap();
+    assert_eq!(review.threshold, 2);
+    assert!(review.inputs.iter().all(|input| input.derivation.is_some()), "{review:#?}");
+    assert_eq!(review.warnings, [], "the node includes each input's previous transaction");
+    let change = review.outputs.iter().find_map(|output| output.derivation).unwrap();
+    assert_eq!(change.keychain, Keychain::Change);
+    let inputs = psbt.inputs.len();
+    assert_eq!(psbt::sign(&cosigner(0), &seeds[0], &mut psbt, &[7; 32]).unwrap(), inputs);
+    // To the second signer and back, as base64.
+    let mut psbt = Psbt::from_str(&psbt.to_string()).unwrap();
+    assert_eq!(psbt::sign(&cosigner(2), &seeds[2], &mut psbt, &[7; 32]).unwrap(), inputs);
+
+    let finalized = node.call("finalizepsbt", json!([psbt.to_string()])).unwrap();
+    assert_eq!(finalized["complete"], true, "{finalized}");
+    node.call("sendrawtransaction", json!([finalized["hex"]])).unwrap();
+    regtest.mine(1, &payee.parse::<Address<_>>().unwrap().assume_checked());
+    let balances = node.call_wallet("multisig", "getbalances", json!([])).unwrap();
+    let mine = &balances["mine"];
+    let total: f64 = ["trusted", "untrusted_pending", "immature"]
+        .iter()
+        .map(|k| mine[k].as_f64().unwrap())
+        .sum();
+    let spent = Amount::ONE_BTC + review.fee;
+    assert_eq!(Amount::from_btc(total).unwrap(), Amount::from_int_btc(101 * 50) - spent);
 }

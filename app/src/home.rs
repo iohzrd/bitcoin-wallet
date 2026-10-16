@@ -6,8 +6,10 @@ use wallet_airgap::qr::Qr;
 use wallet_core::account::{Derivation, Keychain, Kind};
 
 use crate::app::{Screen, Shared};
+use crate::backup::Backup;
+use crate::cosign::Cosign;
 use crate::files;
-use crate::sign::{Files, Purpose};
+use crate::sign::{Files, Purpose, Which};
 use crate::theme::{ACCENT, DIM, FAINT, TEXT, WARN, body, mono, strong};
 use crate::widgets::{
     Emphasis, address, back_pressed, beside_qr, button, button_row, card, chip, menu_item, text,
@@ -51,7 +53,7 @@ impl Home {
                 let sign = menu_item(ui, "Sign", Some("Review a PSBT from the card and sign it"));
                 shared.autofocus(&sign);
                 if sign.clicked() {
-                    next = Some(Screen::Files(Files::new(shared, Purpose::Sign)));
+                    next = Some(Screen::Files(Files::new(shared, Purpose::Sign, Which::Account)));
                 }
             }
             #[cfg(feature = "online")]
@@ -67,7 +69,8 @@ impl Home {
                 let broadcast =
                     menu_item(ui, "Broadcast", Some("Send a signed PSBT to the network"));
                 if broadcast.clicked() {
-                    next = Some(Screen::Files(Files::new(shared, Purpose::Broadcast)));
+                    next =
+                        Some(Screen::Files(Files::new(shared, Purpose::Broadcast, Which::Account)));
                 }
             }
             let export =
@@ -78,7 +81,17 @@ impl Home {
             }
             let addresses = menu_item(ui, "Addresses", Some("Check one another screen shows"));
             if addresses.clicked() {
-                next = Some(Screen::Addresses(Addresses::default()));
+                next = Some(Screen::Addresses(Addresses::new(Which::Account)));
+            }
+            if signer {
+                let backup = menu_item(ui, "Backup", Some("Show, check or SeedQR the words"));
+                if backup.clicked() {
+                    next = Some(Screen::Backup(Backup));
+                }
+                let cosign = menu_item(ui, "Multisig", Some("Co-sign wallets with other devices"));
+                if cosign.clicked() {
+                    next = Some(Screen::Cosign(Cosign));
+                }
             }
             let close = match (self.closing, signer) {
                 (true, true) => "Press again: the seed will be forgotten",
@@ -146,7 +159,7 @@ impl Export {
             });
         });
         if let Some(path) = save {
-            match files::write(&path, format!("{}\n", self.text).as_bytes()) {
+            match files::write(&path, self.text.as_bytes()) {
                 Ok(()) => shared.info(format!("Saved {}", path.display())),
                 Err(error) => shared.error(format!("Saving {}: {error}", path.display())),
             }
@@ -155,24 +168,26 @@ impl Export {
     }
 }
 
-/// The account's addresses, one at a time with its QR code, stepped through with the buttons or
-/// the shoulder buttons.
+/// The addresses of the account or of a multisig it co-signs, one at a time with its QR code,
+/// stepped through with the buttons or the shoulder buttons.
 pub struct Addresses {
+    which: Which,
     derivation: Derivation,
     shown: Option<(Derivation, String, Option<Qr>)>,
 }
 
-impl Default for Addresses {
-    fn default() -> Addresses {
-        Addresses { derivation: Derivation::receive(0), shown: None }
-    }
-}
-
 impl Addresses {
+    pub fn new(which: Which) -> Addresses {
+        Addresses { which, derivation: Derivation::receive(0), shown: None }
+    }
+
     pub fn show(&mut self, ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
-        let Some(wallet) = &shared.wallet else { return Some(Screen::Start) };
+        let wallet = shared.wallet.as_ref();
+        let Some(policy) = wallet.and_then(|wallet| self.which.policy(wallet)) else {
+            return Some(Screen::Start);
+        };
         if self.shown.as_ref().is_none_or(|(shown, ..)| *shown != self.derivation) {
-            let address = wallet.account.address(self.derivation).to_string();
+            let address = policy.address(self.derivation).to_string();
             // Capitals, which a bech32 address may be written in, make the QR code smaller.
             let qr = Qr::new(&address.to_uppercase()).ok();
             self.shown = Some((self.derivation, address, qr));
@@ -219,6 +234,6 @@ impl Addresses {
         // Below 2^31, BIP32's unhardened range.
         let index = self.derivation.index as i64 + step;
         self.derivation.index = index.clamp(0, (1 << 31) - 1) as u32;
-        back_pressed(ui).then(|| Screen::Home(Home::default()))
+        back_pressed(ui).then(|| self.which.home())
     }
 }

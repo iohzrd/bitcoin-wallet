@@ -3268,6 +3268,7 @@ dependencies = [
  "thiserror 2.0.21",
  "ur",
  "wallet-core",
+ "zeroize",
 ]
 
 [[package]]

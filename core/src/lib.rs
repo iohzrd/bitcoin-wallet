@@ -6,8 +6,12 @@
 
 pub mod account;
 pub mod dice;
+pub mod multisig;
+pub mod policy;
 pub mod psbt;
 pub mod seed;
+#[cfg(test)]
+mod testing;
 
 pub use bip39::{self, Mnemonic};
 pub use bitcoin;

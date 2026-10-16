@@ -1,12 +1,16 @@
-//! What the signer shows before it signs, and the signing. A PSBT comes from a machine the signer
-//! does not trust, so it takes nothing in it on its word: an input is the account's, and is
-//! signed, only when the account's descriptor at the path the PSBT claims gives the script it
-//! spends; an output is change only when the same holds for the script it pays; and the fee is
-//! what the spent outputs hold less what the transaction pays, with each amount read from the
-//! input's whole previous transaction, which its outpoint commits to, when the PSBT carries it.
+//! What the signer shows before it signs, and the signing, for an account of one key or a
+//! multisig wallet alike. A PSBT comes from a machine the signer does not trust, so it takes
+//! nothing in it on its word: an input is the policy's, and is signed, only when the policy's
+//! descriptor at the path the PSBT claims gives the script it spends; an output is change only
+//! when the same holds for the script it pays; and the fee is what the spent outputs hold less
+//! what the transaction pays, with each amount read from the input's whole previous transaction,
+//! which its outpoint commits to, when the PSBT carries it. Where established signers (Coldcard,
+//! Ledger, Trezor, Jade, BDK) refuse or warn, this does too; their thresholds are noted where
+//! they are used.
 
 use std::collections::BTreeMap;
 
+use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{self, KeySource, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::key::{TapTweak, XOnlyPublicKey};
@@ -14,44 +18,76 @@ use bitcoin::psbt::{self as bip174, Psbt, PsbtSighashType};
 use bitcoin::secp256k1::{self, Message, Secp256k1};
 use bitcoin::sighash::{self, EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::TapLeafHash;
-use bitcoin::{Address, Amount, OutPoint, TxOut, Weight, ecdsa, taproot};
+use bitcoin::{
+    Address, Amount, OutPoint, Sequence, SignedAmount, TxOut, Weight, ecdsa, taproot, transaction,
+};
 
-use crate::account::{Account, Derivation, Kind};
+use crate::account::Derivation;
+use crate::policy::{Policy, Spend};
 use crate::seed::Seed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("the PSBT's inputs and outputs do not match its transaction's")]
     Malformed,
+    #[error("the transaction's version, {0}, is none of the 1, 2 and 3 the network relays")]
+    UnsupportedVersion(i32),
+    #[error("inputs {first} and {second} spend the same output")]
+    DuplicateInput { first: usize, second: usize },
     #[error("input {input} carries neither the output it spends nor that output's transaction")]
     MissingSpentOutput { input: usize },
     #[error("input {input} carries a previous transaction that is not the one it spends")]
     PreviousTxMismatch { input: usize },
+    #[error("input {input} carries a witness script that is not the wallet's")]
+    WitnessScriptMismatch { input: usize },
     #[error("input {input} asks for sighash type {sighash}, which the signer does not sign")]
     UnsupportedSighash { input: usize, sighash: PsbtSighashType },
+    #[error("an amount is more than there are bitcoin")]
+    ExcessiveAmount,
     #[error("the outputs pay more than the inputs spend")]
     NegativeFee,
     #[error("the amounts overflow")]
     AmountOverflow,
-    #[error("the seed is not the one the account was made from (a different passphrase?)")]
+    #[error("the seed holds no key of this wallet's (a different passphrase?)")]
     WrongSeed,
+    #[error("the signature made for input {input} does not verify; nothing was signed")]
+    SignatureCheck { input: usize },
     #[error(transparent)]
     Bip32(#[from] bip32::Error),
     #[error(transparent)]
     SegwitV0Sighash(#[from] sighash::P2wpkhError),
     #[error(transparent)]
     TaprootSighash(#[from] sighash::TaprootError),
+    #[error(transparent)]
+    InputIndex(#[from] transaction::InputsIndexError),
 }
 
-/// A PSBT as the account sees it: what the signer shows before it signs.
+/// How far past the inputs' highest index change may sit before it is flagged: a wallet restored
+/// from its seed scans only so far ahead of the last address it finds used. Coldcard's margin.
+pub const GAP: u32 = 200;
+
+/// A fee this large a share of what the inputs hold, in percent, is flagged. Coldcard warns at 5%
+/// of the outputs (and refuses at 10%); Ledger at 10% of the inputs.
+pub const HIGH_FEE_PERCENT: u64 = 5;
+
+/// A fee rate above this, in sat/vB, is flagged whatever its share. Trezor asks for confirmation
+/// above 2,000; no transaction has needed 1,000 to confirm in years.
+pub const HIGH_FEE_RATE: f64 = 1_000.0;
+
+/// A PSBT as the policy sees it: what the signer shows before it signs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Review {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
     pub fee: Amount,
+    /// The signatures each of the policy's inputs takes: 1, or a multisig's threshold.
+    pub threshold: usize,
     /// The most the transaction can weigh once signed. It is known when every input is the
     /// account's, as another's input's witness is not.
     pub max_weight: Option<Weight>,
+    /// The transaction's nLockTime: the block or the time before which it is not valid, which
+    /// Bitcoin Core sets near the chain's tip to discourage fee sniping.
+    pub lock_time: LockTime,
     pub warnings: Vec<Warning>,
 }
 
@@ -60,8 +96,10 @@ pub struct Input {
     pub previous_output: OutPoint,
     /// The output the input spends.
     pub spent: TxOut,
-    /// The account's key the input spends, when it is the account's.
+    /// The policy's key the input spends, when it is the policy's.
     pub derivation: Option<Derivation>,
+    /// The signatures the input carries; `usize::MAX` once it is finalized.
+    pub signatures: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,19 +107,35 @@ pub struct Output {
     pub txout: TxOut,
     /// The output's address, unless its script has none (an `OP_RETURN`, say).
     pub address: Option<Address>,
-    /// The account's key the output pays, when it is the account's: change, or a payment to one
-    /// of the account's own receive addresses.
+    /// The policy's key the output pays, when it is the policy's: change, or a payment to one of
+    /// its own receive addresses.
     pub derivation: Option<Derivation>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Warning {
-    /// A segwit v0 input of the account's whose PSBT carries the output it spends but not that
-    /// output's transaction, so its amount is the coordinator's word. A segwit v0 signature
-    /// commits to its own input's amount alone: a coordinator that understates one input's
-    /// amount in one PSBT and another's in a second can combine the signatures of both into a
-    /// transaction whose fee the user never saw. Taproot signatures commit to every amount.
-    UnverifiedAmount { input: usize },
+    /// Segwit v0 inputs of the policy's whose PSBT carries the outputs they spend but not those
+    /// outputs' transactions, so their amounts are the coordinator's word. A segwit v0 signature
+    /// commits to its own input's amount alone: a coordinator that understates one input's amount
+    /// in one PSBT and another's in a second can combine the signatures of both into a
+    /// transaction whose fee the user never saw. It takes two such inputs, so one is not flagged
+    /// (as Krux does); taproot signatures commit to every amount.
+    UnverifiedAmounts { inputs: Vec<usize> },
+    /// An output that names one of the policy's keys at a change or receive path but pays a
+    /// script the policy does not: a payment dressed as change, which Coldcard calls fraud. It
+    /// is shown as the payment it is.
+    FakeChange { output: usize },
+    /// An output of the policy's at an index further past its inputs' highest than `GAP`, which a
+    /// wallet restored from the seed would not scan far enough to find.
+    DistantIndex { output: usize, index: u32 },
+    /// A fee of `HIGH_FEE_PERCENT` or more of what the inputs hold, or above `HIGH_FEE_RATE`.
+    HighFee,
+    /// Inputs that are not the policy's, which it does not sign. Its signatures commit to its own
+    /// inputs' amounts only, so what leaves the policy is `Review::net_spent`; the fee is as
+    /// good as the others' amounts.
+    ForeignInputs { count: usize },
+    /// A locktime that does nothing, as every input's sequence is final.
+    LocktimeIgnored,
 }
 
 impl Review {
@@ -90,36 +144,117 @@ impl Review {
         let vsize = self.max_weight?.to_vbytes_ceil();
         Some(self.fee.to_sat() as f64 / vsize as f64)
     }
+
+    /// Whether every input carries the signatures it takes, so the transaction can be finalized:
+    /// the policy's inputs `threshold` each, and any other one at least one.
+    pub fn complete(&self) -> bool {
+        (self.inputs.iter()).all(|input| match input.derivation {
+            Some(_) => input.signatures >= self.threshold,
+            None => input.signatures > 0,
+        })
+    }
+
+    /// What leaves the policy: what its inputs hold less what its outputs get back. With no other
+    /// inputs, that is the payments and the fee.
+    pub fn net_spent(&self) -> SignedAmount {
+        let ours_in: u64 = (self.inputs.iter())
+            .filter(|input| input.derivation.is_some())
+            .map(|input| input.spent.value.to_sat())
+            .sum();
+        let ours_out: u64 = (self.outputs.iter())
+            .filter(|output| output.derivation.is_some())
+            .map(|output| output.txout.value.to_sat())
+            .sum();
+        // Every amount is at most 21 million bitcoin, which `review` checks, so neither sum
+        // overflows i64 in a transaction the network would accept.
+        SignedAmount::from_sat(ours_in as i64 - ours_out as i64)
+    }
 }
 
-pub fn review(account: &Account, psbt: &Psbt) -> Result<Review, Error> {
+/// The signatures `input` carries, of any kind; `usize::MAX` once it is finalized.
+pub fn signatures(input: &bip174::Input) -> usize {
+    if is_finalized(input) {
+        return usize::MAX;
+    }
+    input.partial_sigs.len()
+        + input.tap_script_sigs.len()
+        + usize::from(input.tap_key_sig.is_some())
+}
+
+fn is_finalized(input: &bip174::Input) -> bool {
+    input.final_script_witness.is_some() || input.final_script_sig.is_some()
+}
+
+pub fn review(policy: &dyn Policy, psbt: &Psbt) -> Result<Review, Error> {
     let tx = &psbt.unsigned_tx;
     if psbt.inputs.len() != tx.input.len() || psbt.outputs.len() != tx.output.len() {
         return Err(Error::Malformed);
     }
+    if !(1..=3).contains(&tx.version.0) {
+        return Err(Error::UnsupportedVersion(tx.version.0));
+    }
+    let mut seen = BTreeMap::new();
+    for (index, txin) in tx.input.iter().enumerate() {
+        if let Some(first) = seen.insert(txin.previous_output, index) {
+            return Err(Error::DuplicateInput { first, second: index });
+        }
+    }
+
     let mut inputs = Vec::with_capacity(tx.input.len());
     let mut warnings = Vec::new();
+    let mut unverified = Vec::new();
     for (index, (txin, input)) in tx.input.iter().zip(&psbt.inputs).enumerate() {
         let spent = spent_output(index, txin.previous_output, input)?;
         let derivation = claimed_keys(&input.bip32_derivation, &input.tap_key_origins)
-            .find_map(|source| account.derivation_of(source, &spent.script_pubkey));
-        if derivation.is_some() {
-            check_sighash(account.kind(), index, input)?;
-            if account.kind() == Kind::SegwitV0 && input.non_witness_utxo.is_none() {
-                warnings.push(Warning::UnverifiedAmount { input: index });
+            .find_map(|source| policy.derivation_of(source, &spent.script_pubkey));
+        if let Some(derivation) = derivation {
+            let spend = policy.spend(derivation);
+            check_sighash(&spend, index, input)?;
+            if let Spend::SegwitV0Script(witness_script) = &spend
+                && input.witness_script.as_ref().is_some_and(|given| given != witness_script)
+            {
+                return Err(Error::WitnessScriptMismatch { input: index });
+            }
+            if spend.is_segwit_v0() && input.non_witness_utxo.is_none() {
+                unverified.push(index);
             }
         }
-        inputs.push(Input { previous_output: txin.previous_output, spent, derivation });
+        let signatures = signatures(input);
+        inputs.push(Input { previous_output: txin.previous_output, spent, derivation, signatures });
     }
-    let outputs: Vec<Output> = (tx.output.iter().zip(&psbt.outputs))
-        .map(|(txout, output)| Output {
-            address: Address::from_script(&txout.script_pubkey, account.network()).ok(),
-            derivation: claimed_keys(&output.bip32_derivation, &output.tap_key_origins)
-                .find_map(|source| account.derivation_of(source, &txout.script_pubkey)),
-            txout: txout.clone(),
-        })
-        .collect();
+    if unverified.len() > 1 {
+        warnings.push(Warning::UnverifiedAmounts { inputs: unverified });
+    }
+    let others = inputs.iter().filter(|input| input.derivation.is_none()).count();
+    if others > 0 {
+        warnings.push(Warning::ForeignInputs { count: others });
+    }
 
+    let highest_input = inputs.iter().filter_map(|input| input.derivation).map(|d| d.index).max();
+    let mut outputs = Vec::with_capacity(tx.output.len());
+    for (index, (txout, output)) in tx.output.iter().zip(&psbt.outputs).enumerate() {
+        let claimed: Vec<&KeySource> =
+            claimed_keys(&output.bip32_derivation, &output.tap_key_origins).collect();
+        let derivation =
+            claimed.iter().find_map(|source| policy.derivation_of(source, &txout.script_pubkey));
+        match (derivation, highest_input) {
+            (None, _) if claimed.iter().any(|source| policy.claims(source)) => {
+                warnings.push(Warning::FakeChange { output: index });
+            }
+            (Some(derivation), Some(highest)) if derivation.index > highest.saturating_add(GAP) => {
+                warnings.push(Warning::DistantIndex { output: index, index: derivation.index });
+            }
+            _ => {}
+        }
+        let address = Address::from_script(&txout.script_pubkey, policy.network()).ok();
+        outputs.push(Output { txout: txout.clone(), address, derivation });
+    }
+
+    let amounts = inputs.iter().map(|input| input.spent.value);
+    let amounts = amounts.chain(outputs.iter().map(|output| output.txout.value));
+    if amounts.clone().any(|amount| amount > Amount::MAX_MONEY) {
+        return Err(Error::ExcessiveAmount);
+    }
     let spent = total(inputs.iter().map(|input| input.spent.value))?;
     let paid = total(outputs.iter().map(|output| output.txout.value))?;
     let fee = spent.checked_sub(paid).ok_or(Error::NegativeFee)?;
@@ -128,51 +263,73 @@ pub fn review(account: &Account, psbt: &Psbt) -> Result<Review, Error> {
         // marker and flag (2 WU) and no witness stack counts (1 WU an input). Signing adds those,
         // and to each input the satisfaction weight, which counts from an empty stack.
         let inputs = inputs.len() as u64;
-        tx.weight() + Weight::from_wu(2 + inputs) + account.max_satisfaction_weight() * inputs
+        tx.weight() + Weight::from_wu(2 + inputs) + policy.max_satisfaction_weight() * inputs
     });
-    Ok(Review { inputs, outputs, fee, max_weight, warnings })
+    let lock_time = tx.lock_time;
+    if lock_time != LockTime::ZERO && tx.input.iter().all(|txin| txin.sequence == Sequence::MAX) {
+        warnings.push(Warning::LocktimeIgnored);
+    }
+    let threshold = policy.threshold();
+    let mut review = Review { inputs, outputs, fee, threshold, max_weight, lock_time, warnings };
+    let large_share = fee.to_sat() * 100 >= spent.to_sat() * HIGH_FEE_PERCENT && fee > Amount::ZERO;
+    if large_share || review.min_fee_rate().is_some_and(|rate| rate > HIGH_FEE_RATE) {
+        review.warnings.push(Warning::HighFee);
+    }
+    Ok(review)
 }
 
-/// Signs every input `review` finds to be the account's with the key `seed` derives for it, and
-/// returns how many it signed. `aux_rand` is fresh randomness for BIP340, which mixes it into
-/// each taproot signature's nonce to guard the key against side channels; the nonce commits to
-/// the key and the message as well, so one draw serves every input. ECDSA nonces are RFC6979's.
+/// Signs every input `review` finds to be the policy's with the key `seed` derives for it, and
+/// returns how many it signed. Inputs already finalized are left as they are. `aux_rand` is
+/// fresh randomness for BIP340, which mixes it into each taproot signature's nonce to guard the
+/// key against side channels; the nonce commits to the key and the message as well, so one draw
+/// serves every input. ECDSA nonces are RFC6979's. Each signature is verified once made, as BDK
+/// does, against a fault in the signing; if one fails, the PSBT is left unsigned.
 pub fn sign(
-    account: &Account,
+    policy: &dyn Policy,
     seed: &Seed,
     psbt: &mut Psbt,
     aux_rand: &[u8; 32],
 ) -> Result<usize, Error> {
-    let review = review(account, psbt)?;
+    let review = review(policy, psbt)?;
+    let ((fingerprint, path), xpub) = policy.signer().ok_or(Error::WrongSeed)?;
     let secp = Secp256k1::new();
-    let master = seed.master(account.network());
-    let account_key = master.derive_priv(&secp, account.path())?;
-    if master.fingerprint(&secp) != account.fingerprint()
-        || Xpub::from_priv(&secp, &account_key) != *account.xpub()
-    {
+    let master = seed.master(policy.network());
+    let signer_key = master.derive_priv(&secp, path)?;
+    if master.fingerprint(&secp) != *fingerprint || Xpub::from_priv(&secp, &signer_key) != *xpub {
         return Err(Error::WrongSeed);
     }
 
     let prevouts: Vec<TxOut> = review.inputs.iter().map(|input| input.spent.clone()).collect();
+    let mut signed_psbt = psbt.clone();
     let mut sighashes = SighashCache::new(&psbt.unsigned_tx);
     let mut signed = 0;
     for (index, input) in review.inputs.iter().enumerate() {
         let Some(derivation) = input.derivation else { continue };
-        let key = account_key.derive_priv(&secp, &derivation.path())?;
-        let psbt_input = &mut psbt.inputs[index];
-        match account.kind() {
-            Kind::SegwitV0 => {
-                let sighash_type = EcdsaSighashType::All;
-                let TxOut { value, script_pubkey } = &input.spent;
-                let sighash =
-                    sighashes.p2wpkh_signature_hash(index, script_pubkey, *value, sighash_type)?;
-                let message = Message::from_digest(sighash.to_byte_array());
-                let signature = secp.sign_ecdsa_low_r(&message, &key.private_key);
-                let public_key = bitcoin::PublicKey::new(key.private_key.public_key(&secp));
-                let signature = ecdsa::Signature { signature, sighash_type };
-                psbt_input.partial_sigs.insert(public_key, signature);
+        if is_finalized(&psbt.inputs[index]) {
+            continue;
+        }
+        let key = signer_key.derive_priv(&secp, &derivation.path())?;
+        let psbt_input = &mut signed_psbt.inputs[index];
+        let TxOut { value, script_pubkey } = &input.spent;
+        let ecdsa_sighash = match policy.spend(derivation) {
+            Spend::SegwitV0Key => Some(sighashes.p2wpkh_signature_hash(
+                index,
+                script_pubkey,
+                *value,
+                EcdsaSighashType::All,
+            )?),
+            Spend::SegwitV0Script(witness_script) => {
+                let sighash = sighashes.p2wsh_signature_hash(
+                    index,
+                    &witness_script,
+                    *value,
+                    EcdsaSighashType::All,
+                )?;
+                // The finalizer needs it beside the signatures; `review` refused any other.
+                psbt_input.witness_script = Some(witness_script);
+                Some(sighash)
             }
-            Kind::Taproot => {
+            Spend::TaprootKey => {
                 let sighash_type = psbt_input.taproot_hash_ty().expect("review checked it");
                 let prevouts = Prevouts::All(&prevouts);
                 let sighash =
@@ -181,11 +338,28 @@ pub fn sign(
                 // BIP86's output key is the internal key tweaked with no script tree.
                 let keypair = key.to_keypair(&secp).tap_tweak(&secp, None).to_keypair();
                 let signature = secp.sign_schnorr_with_aux_rand(&message, &keypair, aux_rand);
+                let output_key = keypair.x_only_public_key().0;
+                if secp.verify_schnorr(&signature, &message, &output_key).is_err() {
+                    return Err(Error::SignatureCheck { input: index });
+                }
                 psbt_input.tap_key_sig = Some(taproot::Signature { signature, sighash_type });
+                None
             }
+        };
+        if let Some(sighash) = ecdsa_sighash {
+            let message = Message::from_digest(sighash.to_byte_array());
+            let signature = secp.sign_ecdsa_low_r(&message, &key.private_key);
+            let public_key = key.private_key.public_key(&secp);
+            if secp.verify_ecdsa(&message, &signature, &public_key).is_err() {
+                return Err(Error::SignatureCheck { input: index });
+            }
+            let sighash_type = EcdsaSighashType::All;
+            let signature = ecdsa::Signature { signature, sighash_type };
+            psbt_input.partial_sigs.insert(bitcoin::PublicKey::new(public_key), signature);
         }
         signed += 1;
     }
+    *psbt = signed_psbt;
     Ok(signed)
 }
 
@@ -218,11 +392,13 @@ fn claimed_keys<'a>(
 /// Refuses a sighash type that leaves part of the transaction open: whoever holds a signature
 /// made with one can change the inputs or outputs it does not commit to. ALL commits to the
 /// whole transaction, as does taproot's DEFAULT, which is what an input with none set gets.
-fn check_sighash(kind: Kind, index: usize, input: &bip174::Input) -> Result<(), Error> {
+fn check_sighash(spend: &Spend, index: usize, input: &bip174::Input) -> Result<(), Error> {
     let Some(sighash) = input.sighash_type else { return Ok(()) };
-    let whole = match kind {
-        Kind::SegwitV0 => matches!(sighash.ecdsa_hash_ty(), Ok(EcdsaSighashType::All)),
-        Kind::Taproot => {
+    let whole = match spend {
+        Spend::SegwitV0Key | Spend::SegwitV0Script(_) => {
+            matches!(sighash.ecdsa_hash_ty(), Ok(EcdsaSighashType::All))
+        }
+        Spend::TaprootKey => {
             matches!(sighash.taproot_hash_ty(), Ok(TapSighashType::Default | TapSighashType::All))
         }
     };
@@ -238,14 +414,13 @@ fn total(mut amounts: impl Iterator<Item = Amount>) -> Result<Amount, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::{Account, Kind};
     use crate::seed::tests::abandon;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::transaction::Version;
-    use bitcoin::{Network, ScriptBuf, Sequence, Transaction, TxIn};
-    use miniscript::psbt::PsbtExt;
+    use crate::testing::{
+        AUX_RAND, finalize, finalize_and_verify, funding, spend, verify_with_core,
+    };
+    use bitcoin::{Network, ScriptBuf};
     use std::str::FromStr;
-
-    const AUX_RAND: [u8; 32] = [7; 32];
 
     fn account(kind: Kind) -> Account {
         Account::from_seed(&abandon(""), Network::Regtest, kind, 0).unwrap()
@@ -255,97 +430,6 @@ mod tests {
     fn someone_else(kind: Kind) -> ScriptBuf {
         let other = Account::from_seed(&abandon("someone else"), Network::Regtest, kind, 0);
         other.unwrap().script_pubkey(Derivation::receive(0))
-    }
-
-    /// A transaction paying each amount to its script, for a PSBT to spend.
-    fn funding(outputs: &[(ScriptBuf, u64)]) -> Transaction {
-        let previous_output = OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0);
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn { previous_output, ..TxIn::default() }],
-            output: (outputs.iter())
-                .map(|(script_pubkey, sats)| TxOut {
-                    value: Amount::from_sat(*sats),
-                    script_pubkey: script_pubkey.clone(),
-                })
-                .collect(),
-        }
-    }
-
-    /// A PSBT spending every output of `funding` to `outputs`, made as the account's watch-only
-    /// wallet makes one: with each input's previous transaction, and the account's keys recorded
-    /// for the inputs `spends` names and the outputs that name one.
-    fn spend(
-        account: &Account,
-        funding: &Transaction,
-        spends: &[Option<Derivation>],
-        outputs: &[(ScriptBuf, u64, Option<Derivation>)],
-    ) -> Psbt {
-        let txid = funding.compute_txid();
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: (0..spends.len() as u32)
-                .map(|vout| TxIn {
-                    previous_output: OutPoint::new(txid, vout),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..TxIn::default()
-                })
-                .collect(),
-            output: (outputs.iter())
-                .map(|(script_pubkey, sats, _)| TxOut {
-                    value: Amount::from_sat(*sats),
-                    script_pubkey: script_pubkey.clone(),
-                })
-                .collect(),
-        };
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        for (vout, (input, derivation)) in psbt.inputs.iter_mut().zip(spends).enumerate() {
-            input.witness_utxo = Some(funding.output[vout].clone());
-            input.non_witness_utxo = Some(funding.clone());
-            if let Some(derivation) = derivation {
-                account.annotate_input(input, *derivation);
-            }
-        }
-        for (output, (_, _, derivation)) in psbt.outputs.iter_mut().zip(outputs) {
-            if let Some(derivation) = derivation {
-                account.annotate_output(output, *derivation);
-            }
-        }
-        psbt
-    }
-
-    /// Finalizes a signed PSBT and checks every input with Bitcoin Core's script interpreter.
-    fn finalize_and_verify(psbt: Psbt) -> Transaction {
-        let (tx, spent) = finalize(psbt);
-        verify_with_core(&tx, &spent);
-        tx
-    }
-
-    /// The signed transaction and the outputs it spends.
-    fn finalize(mut psbt: Psbt) -> (Transaction, Vec<TxOut>) {
-        let spent: Vec<TxOut> =
-            (psbt.inputs.iter()).map(|input| input.witness_utxo.clone().unwrap()).collect();
-        psbt.finalize_mut(&Secp256k1::verification_only()).unwrap();
-        (psbt.extract_tx().unwrap(), spent)
-    }
-
-    fn verify_with_core(tx: &Transaction, spent: &[TxOut]) {
-        let serialized = bitcoin::consensus::serialize(tx);
-        let utxos: Vec<bitcoinconsensus::Utxo> = (spent.iter())
-            .map(|txout| bitcoinconsensus::Utxo {
-                script_pubkey: txout.script_pubkey.as_bytes().as_ptr(),
-                script_pubkey_len: txout.script_pubkey.len() as u32,
-                value: txout.value.to_sat() as i64,
-            })
-            .collect();
-        for (index, txout) in spent.iter().enumerate() {
-            let script = txout.script_pubkey.as_bytes();
-            let sats = txout.value.to_sat();
-            bitcoinconsensus::verify(script, sats, &serialized, Some(&utxos), index)
-                .unwrap_or_else(|e| panic!("input {index} fails Core's checks: {e:?}"));
-        }
     }
 
     /// Two of the account's outputs, a payment to someone else, and change.
@@ -427,6 +511,7 @@ mod tests {
             let review = review(&account, &psbt).unwrap();
             assert_eq!(review.outputs[0].derivation, None);
             assert!(review.outputs[0].address.is_some());
+            assert_eq!(review.warnings, [Warning::FakeChange { output: 0 }], "and said so");
         }
     }
 
@@ -449,6 +534,8 @@ mod tests {
             assert_eq!(review.max_weight, None, "another's input's witness is unknown");
             assert_eq!(review.min_fee_rate(), None);
             assert_eq!(review.fee, Amount::from_sat(1_000));
+            assert_eq!(review.warnings, [Warning::ForeignInputs { count: 1 }]);
+            assert_eq!(review.net_spent(), SignedAmount::from_sat(50_000), "this wallet's coin");
             assert_eq!(sign(&account, &abandon(""), &mut psbt, &AUX_RAND).unwrap(), 1);
             assert!(psbt.inputs[1].partial_sigs.is_empty() && psbt.inputs[1].tap_key_sig.is_none());
         }
@@ -496,15 +583,97 @@ mod tests {
     }
 
     #[test]
-    fn a_segwit_v0_input_without_its_previous_transaction_is_flagged() {
+    fn two_segwit_v0_inputs_without_their_previous_transactions_are_flagged() {
         let (account, mut psbt) = payment(Kind::SegwitV0);
         psbt.inputs[0].non_witness_utxo = None;
-        let review = review(&account, &psbt).unwrap();
-        assert_eq!(review.warnings, [Warning::UnverifiedAmount { input: 0 }]);
+        assert_eq!(review(&account, &psbt).unwrap().warnings, [], "one alone cannot be played");
+        psbt.inputs[1].non_witness_utxo = None;
+        let warnings = review(&account, &psbt).unwrap().warnings;
+        assert_eq!(warnings, [Warning::UnverifiedAmounts { inputs: vec![0, 1] }]);
 
         let (account, mut psbt) = payment(Kind::Taproot);
         psbt.inputs[0].non_witness_utxo = None;
-        assert_eq!(super::review(&account, &psbt).unwrap().warnings, [], "taproot commits to it");
+        psbt.inputs[1].non_witness_utxo = None;
+        assert_eq!(review(&account, &psbt).unwrap().warnings, [], "taproot commits to them");
+    }
+
+    #[test]
+    fn transactions_the_network_would_not_take_are_refused() {
+        let (account, mut psbt) = payment(Kind::Taproot);
+        psbt.unsigned_tx.version = bitcoin::transaction::Version(4);
+        assert!(matches!(review(&account, &psbt), Err(Error::UnsupportedVersion(4))));
+
+        let (account, mut psbt) = payment(Kind::Taproot);
+        psbt.unsigned_tx.input[1].previous_output = psbt.unsigned_tx.input[0].previous_output;
+        let refused = review(&account, &psbt);
+        assert!(matches!(refused, Err(Error::DuplicateInput { first: 0, second: 1 })));
+
+        let (account, mut psbt) = payment(Kind::Taproot);
+        psbt.unsigned_tx.output[0].value = Amount::MAX_MONEY + Amount::from_sat(1);
+        assert!(matches!(review(&account, &psbt), Err(Error::ExcessiveAmount)));
+    }
+
+    #[test]
+    fn a_high_fee_is_flagged_by_share_or_by_rate() {
+        let account = account(Kind::Taproot);
+        let small = funding(&[(account.script_pubkey(Derivation::receive(0)), 100_000)]);
+        let spends = [Some(Derivation::receive(0))];
+        let change = Derivation::change(0);
+        let review_of = |kept: u64| {
+            let outputs = [(account.script_pubkey(change), kept, Some(change))];
+            review(&account, &spend(&account, &small, &spends, &outputs)).unwrap()
+        };
+        // A consolidation pays no one else, and its fee is still the user's.
+        assert_eq!(review_of(99_000).warnings, [], "1%");
+        assert_eq!(review_of(94_000).warnings, [Warning::HighFee], "6% of the inputs");
+        // 3,000 sat on a 111-vB transaction is 27 sat/vB; 200,000 sat on a huge input set would
+        // be a high rate by share alone, so the rate is tested on its own below.
+        let review = review_of(99_000);
+        assert!(review.min_fee_rate().unwrap() < HIGH_FEE_RATE);
+
+        let big = funding(&[(account.script_pubkey(Derivation::receive(0)), 1_000_000_000)]);
+        let outputs = [(account.script_pubkey(change), 1_000_000_000 - 200_000, Some(change))];
+        let review = super::review(&account, &spend(&account, &big, &spends, &outputs)).unwrap();
+        assert!(review.min_fee_rate().unwrap() > HIGH_FEE_RATE, "0.02% of the inputs");
+        assert_eq!(review.warnings, [Warning::HighFee]);
+    }
+
+    #[test]
+    fn change_far_past_the_inputs_is_flagged() {
+        let account = account(Kind::SegwitV0);
+        let funding = funding(&[(account.script_pubkey(Derivation::receive(7)), 50_000)]);
+        let spends = [Some(Derivation::receive(7))];
+        for (index, flagged) in [(7 + GAP, false), (8 + GAP, true), ((1 << 31) - 1, true)] {
+            let change = Derivation::change(index);
+            let outputs = [(account.script_pubkey(change), 49_000, Some(change))];
+            let review = review(&account, &spend(&account, &funding, &spends, &outputs)).unwrap();
+            let expected: &[Warning] = match flagged {
+                true => &[Warning::DistantIndex { output: 0, index }],
+                false => &[],
+            };
+            assert_eq!(review.warnings, expected, "{index}");
+        }
+    }
+
+    #[test]
+    fn a_locktime_with_every_sequence_final_is_flagged() {
+        let (account, mut psbt) = payment(Kind::Taproot);
+        psbt.unsigned_tx.lock_time = LockTime::from_height(850_000).unwrap();
+        let review = review(&account, &psbt).unwrap();
+        assert_eq!(review.lock_time, LockTime::from_height(850_000).unwrap());
+        assert_eq!(review.warnings, [], "the inputs signal RBF, which enables it");
+        for txin in &mut psbt.unsigned_tx.input {
+            txin.sequence = bitcoin::Sequence::MAX;
+        }
+        assert_eq!(super::review(&account, &psbt).unwrap().warnings, [Warning::LocktimeIgnored]);
+    }
+
+    #[test]
+    fn a_finalized_input_is_left_as_it_is() {
+        let (account, mut psbt) = payment(Kind::Taproot);
+        psbt.inputs[0].final_script_witness = Some(bitcoin::Witness::from_slice(&[[1u8; 64]]));
+        assert_eq!(sign(&account, &abandon(""), &mut psbt, &AUX_RAND).unwrap(), 1);
+        assert!(psbt.inputs[0].tap_key_sig.is_none() && psbt.inputs[1].tap_key_sig.is_some());
     }
 
     #[test]
