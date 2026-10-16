@@ -19,6 +19,13 @@ fuzz_target!(|data: &[u8]| {
         |at: usize| data.get(at..at + 4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
     let cheap = matches!((word(8), word(12), word(16)), (Some(..=64), Some(..=2), Some(..=2)));
     if cheap || data.len() < 20 {
-        let _ = store::open("passphrase", data);
+        let _ = store::open("passphrase", None, data);
+        let _ = store::open("", Some(&[5; 32]), data);
+    }
+    // A header that reads names a security key only in format 2, with a credential that fits.
+    if let Ok(header) = store::Header::read(data) {
+        let keyed = header.security_key.is_some();
+        assert_eq!(keyed, data[7] == 2);
+        assert!(header.passphrase || keyed, "only a security key goes without a passphrase");
     }
 });

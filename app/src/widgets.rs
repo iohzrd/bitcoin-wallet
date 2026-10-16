@@ -509,6 +509,11 @@ const SYMBOLS: &str = "1234567890-_=+.,:;!?@#$%&*/\\|'\"()[]{}<>~`^";
 const COLUMNS: usize = 9;
 
 impl Keyboard {
+    /// A keyboard open on its digits and symbols, for a PIN.
+    pub fn digits() -> Keyboard {
+        Keyboard { shift: false, symbols: true }
+    }
+
     /// Shows the keys and returns the one pressed, on the screen or on a physical keyboard.
     pub fn show(&mut self, ui: &mut Ui, keys: Keys, first: Option<&mut bool>) -> Option<Press> {
         let mut pressed = typed(ui, keys);

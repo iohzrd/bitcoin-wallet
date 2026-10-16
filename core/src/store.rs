@@ -1,14 +1,19 @@
 //! A wallet kept on the device, for whoever opts into it: its seed (or a watch-only wallet's
-//! descriptor) and the multisig wallets registered with it, encrypted with a passphrase. Without a
-//! secure element to count failed tries, anyone who copies the file can guess at the passphrase on
-//! their own hardware for as long as they like, so the key is Argon2id's, which makes each guess
-//! cost memory as well as time (RFC 9106's second recommended setting: 64 MiB, three passes, four
-//! lanes), and the file is sealed with XChaCha20-Poly1305, which refuses it whole if a byte of it
-//! changed.
+//! descriptor) and the multisig wallets registered with it, encrypted with a passphrase, a
+//! security key, or both. Without a secure element to count failed tries, anyone who copies the
+//! file can guess at a passphrase on their own hardware for as long as they like, so its key is
+//! Argon2id's, which makes each guess cost memory as well as time (RFC 9106's second recommended
+//! setting: 64 MiB, three passes, four lanes). A FIDO2 security key is the secure element the
+//! device lacks: its hmac-secret, which it computes only when touched and given its PIN, and
+//! which it locks after eight wrong PINs, goes into the key as well, so a copy of the file is no
+//! use without the security key in hand. The file is sealed with XChaCha20-Poly1305, which
+//! refuses it whole if a byte of it changed.
 //!
 //! The file: `WALLET`, 0, a format version; Argon2's memory in KiB, passes and lanes, each a
-//! little-endian u32; a 16-byte salt and a 24-byte nonce; then the sealed record, the header its
-//! associated data. The record is text, a line a field.
+//! little-endian u32; a 16-byte salt; in format 2, sealed with a security key, a byte of flags
+//! (1: a passphrase too), the 32-byte salt the security key's secret is asked under, and the
+//! credential's ID, after its length as a little-endian u16; a 24-byte nonce; then the sealed
+//! record, the header its associated data. The record is text, a line a field.
 
 use std::fmt::Write;
 use std::str::FromStr;
@@ -17,6 +22,7 @@ use argon2::{Algorithm, Argon2, Version};
 use bip39::{Language, Mnemonic};
 use bitcoin::Network;
 use bitcoin::bip32::Fingerprint;
+use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
 use bitcoin::hex::{DisplayHex, FromHex};
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -34,13 +40,26 @@ pub enum Error {
     Params,
     #[error("wrong passphrase, or the file is damaged")]
     Passphrase,
+    #[error("wrong passphrase or security key, or the file is damaged")]
+    Unsealed,
+    #[error("it is sealed with a security key, whose secret is needed to open it")]
+    NeedsSecurityKey,
     #[error("the wallet in it is damaged: {0}")]
     Record(String),
 }
 
 const MAGIC: &[u8; 7] = b"WALLET\0";
+/// Sealed under a passphrase alone.
 const FORMAT: u8 = 1;
-const HEADER: usize = 8 + 3 * 4 + 16 + 24;
+/// Sealed under a security key's secret, and a passphrase if one was given.
+const FORMAT_KEYED: u8 = 2;
+/// The magic, the format, Argon2's cost and its salt: what every format begins with.
+const FIXED: usize = 8 + 3 * 4 + 16;
+const NONCE: usize = 24;
+/// The longest credential ID a file may hold. CTAP sets none; keys make IDs of tens of bytes.
+const MOST_CREDENTIAL: usize = 1024;
+/// Set in format 2's flags when a passphrase was given beside the security key.
+const WITH_PASSPHRASE: u8 = 1;
 
 /// Argon2id's cost: memory in KiB, passes over it, and lanes through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,48 +91,160 @@ impl Params {
     }
 }
 
-/// The key a passphrase gives, with the salt and cost it was made with, which sealing the wallet
-/// again writes beside it. Made once, as making it takes seconds, and kept for as long as the
-/// wallet is open, as the seed is.
+/// A FIDO2 credential a file is sealed with: made on a security key for the file, whose
+/// hmac-secret under `salt` goes into the file's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityKey {
+    pub credential: Vec<u8>,
+    pub salt: [u8; 32],
+}
+
+/// What a file's header says of opening it, which can be read before it is opened: the security
+/// key to ask for a secret, if any, and whether a passphrase is needed too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub security_key: Option<SecurityKey>,
+    pub passphrase: bool,
+    params: Params,
+    salt: [u8; 16],
+    nonce: [u8; NONCE],
+    len: usize,
+}
+
+impl Header {
+    pub fn read(file: &[u8]) -> Result<Header, Error> {
+        if file.len() < FIXED + NONCE || !file.starts_with(MAGIC) {
+            return Err(Error::NotKept);
+        }
+        let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+        let params = Params { memory_kib: word(8), passes: word(12), lanes: word(16) };
+        let salt: [u8; 16] = file[20..FIXED].try_into().unwrap();
+        let (security_key, passphrase, nonce_at) = match file[7] {
+            FORMAT => (None, true, FIXED),
+            FORMAT_KEYED => {
+                let flags = *file.get(FIXED).ok_or(Error::NotKept)?;
+                let salt: [u8; 32] = (file.get(FIXED + 1..FIXED + 33))
+                    .and_then(|salt| salt.try_into().ok())
+                    .ok_or(Error::NotKept)?;
+                let len = file.get(FIXED + 33..FIXED + 35).ok_or(Error::NotKept)?;
+                let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
+                if flags & !WITH_PASSPHRASE != 0 || len == 0 || len > MOST_CREDENTIAL {
+                    return Err(Error::NotKept);
+                }
+                let credential = file.get(FIXED + 35..FIXED + 35 + len).ok_or(Error::NotKept)?;
+                let security_key = SecurityKey { credential: credential.to_vec(), salt };
+                (Some(security_key), flags & WITH_PASSPHRASE != 0, FIXED + 35 + len)
+            }
+            format => return Err(Error::Format(format)),
+        };
+        let nonce = (file.get(nonce_at..nonce_at + NONCE))
+            .and_then(|nonce| nonce.try_into().ok())
+            .ok_or(Error::NotKept)?;
+        Ok(Header { security_key, passphrase, params, salt, nonce, len: nonce_at + NONCE })
+    }
+
+    fn write(&self) -> Vec<u8> {
+        let Params { memory_kib, passes, lanes } = self.params;
+        let mut header = Vec::with_capacity(self.len);
+        header.extend(MAGIC);
+        header.push(if self.security_key.is_some() { FORMAT_KEYED } else { FORMAT });
+        for value in [memory_kib, passes, lanes] {
+            header.extend(value.to_le_bytes());
+        }
+        header.extend(self.salt);
+        if let Some(SecurityKey { credential, salt }) = &self.security_key {
+            header.push(if self.passphrase { WITH_PASSPHRASE } else { 0 });
+            header.extend(salt);
+            header.extend((credential.len() as u16).to_le_bytes());
+            header.extend(credential);
+        }
+        header.extend(self.nonce);
+        header
+    }
+}
+
+/// The key a passphrase gives, and a security key's secret with it, with the salt, cost and
+/// credential it was made with, which sealing the wallet again writes beside it. Made once, as
+/// making it takes seconds, and kept for as long as the wallet is open, as the seed is.
 pub struct Key {
     key: Zeroizing<[u8; 32]>,
     salt: [u8; 16],
     params: Params,
+    security_key: Option<SecurityKey>,
+    passphrase: bool,
 }
 
 impl Key {
     /// The key of `passphrase` under `salt`, which should be fresh randomness for each new
     /// passphrase.
     pub fn derive(passphrase: &str, salt: [u8; 16], params: Params) -> Result<Key, Error> {
-        let mut key = Zeroizing::new([0; 32]);
-        (params.argon2()?)
-            .hash_password_into(passphrase.as_bytes(), &salt, key.as_mut())
-            .map_err(|_| Error::Params)?;
-        Ok(Key { key, salt, params })
+        let key = argon2id(passphrase, &salt, params)?;
+        Ok(Key { key, salt, params, security_key: None, passphrase: true })
+    }
+
+    /// The key of `passphrase`, which may be empty, and of the secret the security key gave for
+    /// its credential.
+    pub fn derive_with(
+        passphrase: &str,
+        salt: [u8; 16],
+        params: Params,
+        security_key: SecurityKey,
+        secret: &[u8; 32],
+    ) -> Result<Key, Error> {
+        let stretched = argon2id(passphrase, &salt, params)?;
+        // HKDF's extract, with the security key's secret for its salt: the key is as hard to
+        // find as the harder of the two to get.
+        let mut engine = HmacEngine::<sha256::Hash>::new(secret);
+        engine.input(b"WALLET security key\0");
+        engine.input(stretched.as_ref());
+        let key = Zeroizing::new(Hmac::from_engine(engine).to_byte_array());
+        let passphrase = !passphrase.is_empty();
+        Ok(Key { key, salt, params, security_key: Some(security_key), passphrase })
+    }
+
+    /// The security key the wallet is sealed with, if any.
+    pub fn security_key(&self) -> Option<&SecurityKey> {
+        self.security_key.as_ref()
+    }
+
+    /// Whether a passphrase went into it: always, unless a security key alone did.
+    pub fn has_passphrase(&self) -> bool {
+        self.passphrase
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new(&(*self.key).into())
     }
 
-    fn header(&self, nonce: &[u8; 24]) -> Vec<u8> {
-        let Params { memory_kib, passes, lanes } = self.params;
-        let mut header = Vec::with_capacity(HEADER);
-        header.extend(MAGIC);
-        header.push(FORMAT);
-        for value in [memory_kib, passes, lanes] {
-            header.extend(value.to_le_bytes());
+    fn header(&self, nonce: [u8; NONCE]) -> Header {
+        let credential = self.security_key.as_ref().map_or(0, |key| 35 + key.credential.len());
+        Header {
+            security_key: self.security_key.clone(),
+            passphrase: self.passphrase,
+            params: self.params,
+            salt: self.salt,
+            nonce,
+            len: FIXED + credential + NONCE,
         }
-        header.extend(self.salt);
-        header.extend(nonce);
-        header
     }
+}
+
+fn argon2id(
+    passphrase: &str,
+    salt: &[u8; 16],
+    params: Params,
+) -> Result<Zeroizing<[u8; 32]>, Error> {
+    let mut key = Zeroizing::new([0; 32]);
+    (params.argon2()?)
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
+        .map_err(|_| Error::Params)?;
+    Ok(key)
 }
 
 /// The file that keeps `record` under `key`. `nonce` must be fresh randomness each time: a nonce
 /// used twice under one key gives the two records away.
 pub fn seal(key: &Key, nonce: [u8; 24], record: &Record) -> Vec<u8> {
-    let mut file = key.header(&nonce);
+    let mut file = key.header(nonce).write();
     let plaintext = record.encode();
     let payload = Payload { msg: plaintext.as_bytes(), aad: &file };
     let sealed = key.cipher().encrypt(&nonce.into(), payload).expect("a record seals");
@@ -121,21 +252,26 @@ pub fn seal(key: &Key, nonce: [u8; 24], record: &Record) -> Vec<u8> {
     file
 }
 
-/// The record `file` keeps, and the key `passphrase` gives for it, to seal it again with.
-pub fn open(passphrase: &str, file: &[u8]) -> Result<(Key, Record), Error> {
-    if file.len() < HEADER || !file.starts_with(MAGIC) {
-        return Err(Error::NotKept);
-    }
-    if file[7] != FORMAT {
-        return Err(Error::Format(file[7]));
-    }
-    let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
-    let params = Params { memory_kib: word(8), passes: word(12), lanes: word(16) };
-    let salt: [u8; 16] = file[20..36].try_into().unwrap();
-    let nonce: [u8; 24] = file[36..HEADER].try_into().unwrap();
-    let key = Key::derive(passphrase, salt, params)?;
-    let payload = Payload { msg: &file[HEADER..], aad: &file[..HEADER] };
-    let plaintext = key.cipher().decrypt(&nonce.into(), payload).map_err(|_| Error::Passphrase)?;
+/// The record `file` keeps, and the key `passphrase` gives for it (with the security key's
+/// `secret`, for a file sealed with one), to seal it again with.
+pub fn open(
+    passphrase: &str,
+    secret: Option<&[u8; 32]>,
+    file: &[u8],
+) -> Result<(Key, Record), Error> {
+    let header = Header::read(file)?;
+    let (key, refused) = match (&header.security_key, secret) {
+        (None, _) => (Key::derive(passphrase, header.salt, header.params)?, Error::Passphrase),
+        (Some(security_key), Some(secret)) => {
+            let security_key = security_key.clone();
+            let key =
+                Key::derive_with(passphrase, header.salt, header.params, security_key, secret)?;
+            (key, Error::Unsealed)
+        }
+        (Some(_), None) => return Err(Error::NeedsSecurityKey),
+    };
+    let payload = Payload { msg: &file[header.len..], aad: &file[..header.len] };
+    let plaintext = key.cipher().decrypt(&header.nonce.into(), payload).map_err(|_| refused)?;
     let plaintext = Zeroizing::new(plaintext);
     let text = std::str::from_utf8(&plaintext).map_err(|_| record_error("not text"))?;
     Ok((key, Record::decode(text)?))
@@ -363,12 +499,59 @@ mod tests {
             },
         ] {
             let file = seal(&key, [2; 24], &kept);
-            let (again, opened) = open("correct horse battery staple", &file).unwrap();
+            let (again, opened) = open("correct horse battery staple", None, &file).unwrap();
             assert_eq!(opened, kept);
             // The key it gives back seals it as it was.
             assert_eq!(seal(&again, [2; 24], &opened), file);
-            assert!(matches!(open("correct horse battery stapler", &file), Err(Error::Passphrase)));
+            assert!(matches!(
+                open("correct horse battery stapler", None, &file),
+                Err(Error::Passphrase)
+            ));
         }
+    }
+
+    fn security_key() -> SecurityKey {
+        SecurityKey { credential: vec![9; 48], salt: [3; 32] }
+    }
+
+    #[test]
+    fn a_wallet_sealed_with_a_security_key_takes_its_secret_and_any_passphrase() {
+        let secret = [5; 32];
+        for passphrase in ["", "correct horse"] {
+            let key =
+                Key::derive_with(passphrase, [1; 16], CHEAP, security_key(), &secret).unwrap();
+            let file = seal(&key, [2; 24], &record(None));
+            let header = Header::read(&file).unwrap();
+            assert_eq!(header.security_key, Some(security_key()));
+            assert_eq!(header.passphrase, !passphrase.is_empty());
+            let (again, opened) = open(passphrase, Some(&secret), &file).unwrap();
+            assert_eq!(opened, record(None));
+            assert_eq!(again.security_key(), Some(&security_key()));
+            assert_eq!(seal(&again, [2; 24], &opened), file, "sealed again as it was");
+            // Without the security key's secret, or with another, it stays shut, the right
+            // passphrase or not.
+            assert!(matches!(open(passphrase, None, &file), Err(Error::NeedsSecurityKey)));
+            assert!(matches!(open(passphrase, Some(&[6; 32]), &file), Err(Error::Unsealed)));
+            assert!(matches!(open("wrong", Some(&secret), &file), Err(Error::Unsealed)));
+        }
+    }
+
+    #[test]
+    fn a_byte_changed_anywhere_refuses_a_file_sealed_with_a_security_key() {
+        let key = Key::derive_with("", [1; 16], CHEAP, security_key(), &[5; 32]).unwrap();
+        let file = seal(&key, [2; 24], &record(None));
+        for at in 0..file.len() {
+            let mut tampered = file.clone();
+            tampered[at] ^= 1;
+            assert!(open("", Some(&[5; 32]), &tampered).is_err(), "byte {at}");
+        }
+        // A header cut short anywhere reads as no file of ours, rather than past its end.
+        for len in 0..FIXED + 35 + 48 + NONCE {
+            assert!(Header::read(&file[..len]).is_err(), "{len} bytes");
+        }
+        // A key that is its passphrase alone is no key sealed with a security key's.
+        let plain = Key::derive("", [1; 16], CHEAP).unwrap();
+        assert!(open("", None, &seal(&plain, [2; 24], &record(None))).is_ok());
     }
 
     #[test]
@@ -388,10 +571,13 @@ mod tests {
         for at in 0..file.len() {
             let mut tampered = file.clone();
             tampered[at] ^= 1;
-            assert!(open("passphrase", &tampered).is_err(), "byte {at}");
+            assert!(open("passphrase", None, &tampered).is_err(), "byte {at}");
         }
-        assert!(matches!(open("passphrase", &file[..file.len() - 1]), Err(Error::Passphrase)));
-        assert!(matches!(open("passphrase", b"WALLET"), Err(Error::NotKept)));
+        assert!(matches!(
+            open("passphrase", None, &file[..file.len() - 1]),
+            Err(Error::Passphrase)
+        ));
+        assert!(matches!(open("passphrase", None, b"WALLET"), Err(Error::NotKept)));
     }
 
     #[test]
@@ -399,9 +585,9 @@ mod tests {
         let key = Key::derive("passphrase", [1; 16], CHEAP).unwrap();
         let mut file = seal(&key, [2; 24], &record(None));
         file[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(matches!(open("passphrase", &file), Err(Error::Params)));
-        file[7] = 2;
-        assert!(matches!(open("passphrase", &file), Err(Error::Format(2))));
+        assert!(matches!(open("passphrase", None, &file), Err(Error::Params)));
+        file[7] = 3;
+        assert!(matches!(open("passphrase", None, &file), Err(Error::Format(3))));
     }
 
     /// The format, byte for byte: a change to it fails this, and needs a new format version.
@@ -410,9 +596,22 @@ mod tests {
         let key = Key::derive("passphrase", [1; 16], CHEAP).unwrap();
         let file = seal(&key, [2; 24], &record(None));
         assert_eq!(
-            file[..HEADER].to_lower_hex_string(),
+            file[..FIXED + NONCE].to_lower_hex_string(),
             "57414c4c4554000108000000010000000100000001010101010101010101010101010101\
              020202020202020202020202020202020202020202020202"
+        );
+        let key = Key::derive_with("", [1; 16], CHEAP, security_key(), &[5; 32]).unwrap();
+        let keyed = seal(&key, [2; 24], &record(None));
+        assert_eq!(
+            keyed[..FIXED + 35 + 48 + NONCE].to_lower_hex_string(),
+            [
+                "57414c4c4554000208000000010000000100000001010101010101010101010101010101",
+                &format!("00{}", "03".repeat(32)),
+                "3000",
+                &"09".repeat(48),
+                &"02".repeat(24),
+            ]
+            .concat()
         );
         let expected = "network regtest\nbirthday 1700000000\nwords abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\nfingerprint 73c5da0a\nkind taproot\nmultisig wsh(sortedmulti(2,a,b,c))#checksum 5661756c742031\nmultisig wsh(multi(1,a)) \n";
         assert_eq!(*record(None).encode(), expected);

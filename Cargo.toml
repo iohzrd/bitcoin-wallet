@@ -22,6 +22,8 @@ bitcoinconsensus = "0.106"
 # Core draws no randomness of its own: the app passes in each nonce.
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.7", features = ["derive"] }
+# FIDO2 security keys over USB HID (hidraw), for sealing a kept wallet with one.
+ctap-hid-fido2 = "3.6"
 # No accesskit (its Linux backend talks D-Bus), no wgpu: glow's OpenGL ES is what the
 # handhelds' Mali GPUs run under Mesa's Panfrost.
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }

@@ -6,9 +6,13 @@ publish.workspace = true
 
 [features]
 online = ["dep:wallet-node"]
+# Sealing a kept wallet with a FIDO2 security key, over USB: off by default, as it brings a FIDO2
+# library and the HID stack into the build.
+security-key = ["dep:ctap-hid-fido2"]
 
 [dependencies]
 clap.workspace = true
+ctap-hid-fido2 = { workspace = true, optional = true }
 eframe.workspace = true
 getrandom.workspace = true
 gilrs.workspace = true

@@ -57,6 +57,9 @@ fn stores(dir: &Path) {
     let cheap = Params { memory_kib: 8, passes: 1, lanes: 1 };
     let key = Key::derive("passphrase", [1; 16], cheap).unwrap();
     write(dir, "sealed", store::seal(&key, [2; 24], &seed));
+    let security_key = store::SecurityKey { credential: vec![9; 48], salt: [3; 32] };
+    let keyed = Key::derive_with("", [1; 16], cheap, security_key, &[5; 32]).unwrap();
+    write(dir, "sealed-with-a-key", store::seal(&keyed, [2; 24], &seed));
 }
 
 fn write(dir: &Path, name: &str, data: impl AsRef<[u8]>) {

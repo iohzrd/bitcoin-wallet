@@ -7,6 +7,7 @@ mod app;
 mod backup;
 mod cosign;
 mod create;
+mod fido;
 mod files;
 mod gamepad;
 mod home;
@@ -63,7 +64,11 @@ fn main() -> eframe::Result {
     let dirs = if args.dirs.is_empty() { files::default_dirs() } else { args.dirs.clone() };
     let data_dir = args.data_dir.clone().or_else(files::default_data_dir);
     let store = data_dir.filter(|_| !args.no_store).map(|dir| keep::path(&dir, args.network));
-    let config = app::Config { network: args.network, dirs, store, kdf: Params::DEFAULT };
+    #[cfg(feature = "security-key")]
+    let keys: fido::Keys = Some(std::sync::Arc::new(fido::Hid));
+    #[cfg(not(feature = "security-key"))]
+    let keys: fido::Keys = None;
+    let config = app::Config { network: args.network, dirs, store, kdf: Params::DEFAULT, keys };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Wallet")

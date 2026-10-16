@@ -35,6 +35,9 @@ pub struct Config {
     pub store: Option<PathBuf>,
     /// What a kept wallet's key costs to make.
     pub kdf: Params,
+    /// The security keys a kept wallet can be sealed with: none in a build without the
+    /// `security-key` feature.
+    pub keys: crate::fido::Keys,
 }
 
 /// The open wallet: an account, and the seed it derives from unless it is watch-only.

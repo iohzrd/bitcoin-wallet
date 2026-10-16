@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use eframe::egui::{Event, Key, Role, vec2};
 use egui_kittest::Harness;
@@ -21,6 +22,7 @@ use wallet_core::seed::Seed;
 use wallet_core::store::Params;
 
 use crate::app::{App, Config, Screen, Wallet};
+use crate::fido::{Fake, Keys, SecurityKeys};
 
 const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
                        abandon abandon about";
@@ -35,7 +37,12 @@ const CHEAP: Params = Params { memory_kib: 8, passes: 1, lanes: 1 };
 
 /// The app, keeping a wallet in `store`, if any.
 fn app_keeping(dirs: Vec<PathBuf>, store: Option<PathBuf>) -> App {
-    let config = Config { network: Network::Regtest, dirs, store, kdf: CHEAP };
+    app_with_keys(dirs, store, Some(Arc::new(Fake::new(Some("1234")))))
+}
+
+/// The app, keeping a wallet in `store`, if any, with `keys` for its security keys.
+fn app_with_keys(dirs: Vec<PathBuf>, store: Option<PathBuf>, keys: Keys) -> App {
+    let config = Config { network: Network::Regtest, dirs, store, kdf: CHEAP, keys };
     #[cfg(feature = "online")]
     let online = {
         let auth = wallet_node::Auth::UserPass { user: String::new(), password: String::new() };
@@ -558,13 +565,15 @@ fn enter(harness: &mut Harness<App>, text: &str) {
     harness.run();
 }
 
-/// Moves the focus down to the widget labeled `label`, as the D-pad does.
+/// Moves the focus to the widget labeled `label`, down and then up, as the D-pad does.
 fn focus(harness: &mut Harness<App>, label: &str) {
-    for _ in 0..12 {
-        if harness.get_by_label(label).is_focused() {
-            return;
+    for direction in [Key::ArrowDown, Key::ArrowUp] {
+        for _ in 0..12 {
+            if harness.get_by_label(label).is_focused() {
+                return;
+            }
+            press(harness, direction);
         }
-        press(harness, Key::ArrowDown);
     }
     panic!("{label} never took the focus");
 }
@@ -672,7 +681,8 @@ fn a_seed_passphrase_not_kept_is_asked_for_and_checked() {
     enter(&mut harness, "correct horse battery staple");
     settle(&mut harness, at_home);
     let file = std::fs::read(&store).unwrap();
-    let (_, record) = wallet_core::store::open("correct horse battery staple", &file).unwrap();
+    let (_, record) =
+        wallet_core::store::open("correct horse battery staple", None, &file).unwrap();
     let wallet_core::store::Kept::Seed { passphrase, .. } = record.wallet else { panic!() };
     assert!(passphrase.is_none(), "the seed's passphrase is not kept");
     close(&mut harness);
@@ -707,6 +717,115 @@ fn a_kept_wallet_is_forgotten_with_two_presses() {
     assert!(harness.state_mut().shared().kept.is_none());
     close(&mut harness);
     assert!(harness.query_by_label("Unlock").is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn title(harness: &Harness<App>) -> String {
+    harness.state().screen_title()
+}
+
+#[test]
+fn a_wallet_sealed_with_a_security_key_alone_unlocks_with_its_pin() {
+    let dir = temp_dir("security-key");
+    let store = dir.join("regtest.wallet");
+    let keys = Arc::new(Fake::new(Some("1234")));
+    let mut app = app_with_keys(vec![dir.clone()], Some(store.clone()), Some(keys.clone()));
+    app.open(abandon());
+    let mut harness = harness(app);
+    choose(&mut harness, "Keep on this device");
+    choose(&mut harness, "Security key");
+    shown(&harness, "locks after eight wrong PINs");
+    choose(&mut harness, "Continue");
+    assert_eq!(title(&harness), "A passphrase too, or none");
+    enter(&mut harness, "");
+    assert_eq!(title(&harness), "The key's PIN");
+    enter(&mut harness, "12");
+    shown(&harness, "at least 4 characters");
+    enter(&mut harness, "1234");
+    settle(&mut harness, at_home);
+    shown(&harness, "Kept on this device");
+    let header = wallet_core::store::Header::read(&std::fs::read(&store).unwrap()).unwrap();
+    assert!(header.security_key.is_some() && !header.passphrase);
+    close(&mut harness);
+
+    // No passphrase to type: the key's PIN, and a touch.
+    press(&mut harness, Key::Enter); // Unlock
+    assert_eq!(title(&harness), "The key's PIN");
+    keys.plug(false);
+    enter(&mut harness, "1234");
+    settle(&mut harness, |harness| harness.query_by_label_contains("Plug in your").is_some());
+    assert_eq!(title(&harness), "The key's PIN");
+    keys.plug(true);
+    enter(&mut harness, "0000");
+    settle(&mut harness, |harness| harness.query_by_label_contains("7 tries left").is_some());
+    enter(&mut harness, "1234");
+    settle(&mut harness, at_home);
+    let shared = harness.state_mut().shared();
+    assert_eq!(shared.wallet.as_ref().unwrap().account.fingerprint().to_string(), "73c5da0a");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_key_without_a_pin_has_one_chosen_and_a_passphrase_beside_it_is_asked_for() {
+    let dir = temp_dir("security-key-pin");
+    let store = dir.join("regtest.wallet");
+    let keys = Arc::new(Fake::new(None));
+    let mut app = app_with_keys(vec![dir.clone()], Some(store.clone()), Some(keys.clone()));
+    app.open(abandon());
+    let mut harness = harness(app);
+    choose(&mut harness, "Keep on this device");
+    choose(&mut harness, "Security key");
+    choose(&mut harness, "Continue");
+    enter(&mut harness, "correct horse battery staple");
+    enter(&mut harness, "correct horse battery staple");
+    assert_eq!(title(&harness), "Choose the key's PIN");
+    enter(&mut harness, "4321");
+    assert_eq!(title(&harness), "The PIN again, to check it");
+    enter(&mut harness, "4321");
+    settle(&mut harness, at_home);
+    assert!(keys.state().unwrap().pin_set, "the PIN chosen is set on the key");
+    let header = wallet_core::store::Header::read(&std::fs::read(&store).unwrap()).unwrap();
+    assert!(header.security_key.is_some() && header.passphrase);
+    close(&mut harness);
+
+    press(&mut harness, Key::Enter); // Unlock
+    assert_eq!(title(&harness), "Unlock");
+    enter(&mut harness, "correct horse battery stapler");
+    enter(&mut harness, "4321");
+    settle(&mut harness, |harness| {
+        harness.query_by_label_contains("wrong passphrase or security key").is_some()
+    });
+    assert_eq!(title(&harness), "Unlock", "a wrong passphrase starts over");
+    enter(&mut harness, "correct horse battery staple");
+    enter(&mut harness, "4321");
+    settle(&mut harness, at_home);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_build_without_security_keys_offers_none_and_says_so_of_a_wallet_sealed_with_one() {
+    let dir = temp_dir("no-security-keys");
+    let store = dir.join("regtest.wallet");
+    let key = wallet_core::store::SecurityKey { credential: vec![9; 48], salt: [3; 32] };
+    let cheap = wallet_core::store::Key::derive_with("", [1; 16], CHEAP, key, &[5; 32]).unwrap();
+    let record = wallet_core::store::Record {
+        network: Network::Regtest,
+        birthday: 0,
+        wallet: wallet_core::store::Kept::Watch {
+            descriptor: abandon().account.descriptor().to_string(),
+        },
+        multisigs: Vec::new(),
+    };
+    std::fs::write(&store, wallet_core::store::seal(&cheap, [2; 24], &record)).unwrap();
+    let mut harness = harness(app_with_keys(vec![dir.clone()], Some(store), None));
+    press(&mut harness, Key::Enter); // Unlock
+    assert!(matches!(harness.state().screen(), Screen::Start));
+    shown(&harness, "build it with --features security-key");
+
+    harness.state_mut().open(abandon());
+    harness.run();
+    choose(&mut harness, "Keep on this device");
+    assert!(harness.query_by_label("Security key").is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -878,12 +997,23 @@ fn screenshots() {
         shot(&mut harness, "28-kept");
         choose(&mut harness, "Keep on this device");
         shot(&mut harness, "29-kept-options");
-        press(&mut harness, Key::Escape);
+        choose(&mut harness, "Security key");
+        shot(&mut harness, "30-kept-security-key");
+        choose(&mut harness, "Seal it again");
+        shot(&mut harness, "31-passphrase-or-none");
+        enter(&mut harness, "");
+        type_text(&mut harness, "12");
+        shot(&mut harness, "32-key-pin");
+        for _ in 0..2 {
+            press(&mut harness, Key::Backspace);
+        }
+        enter(&mut harness, "1234");
+        settle(&mut harness, at_home);
         close(&mut harness);
-        shot(&mut harness, "30-start-kept");
+        shot(&mut harness, "33-start-kept");
         press(&mut harness, Key::Enter); // Unlock
-        type_text(&mut harness, "correct horse");
-        shot(&mut harness, "31-unlock");
+        type_text(&mut harness, "12");
+        shot(&mut harness, "34-unlock-pin");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -911,7 +1041,9 @@ fn a_hot_wallet_pays_through_the_node_and_hands_out_its_addresses() {
     let wallet = abandon();
     let account = wallet.account.clone();
     regtest.mine(101, &account.address(Derivation::receive(0)));
-    let config = Config { network: Network::Regtest, dirs: Vec::new(), store: None, kdf: CHEAP };
+    let keys: Keys = Some(Arc::new(Fake::new(None)));
+    let config =
+        Config { network: Network::Regtest, dirs: Vec::new(), store: None, kdf: CHEAP, keys };
     let online = crate::online::Online::new(regtest.node.clone(), Network::Regtest);
     let mut app = App::new(config, None, online);
     app.open(wallet);

@@ -34,7 +34,10 @@ pub fn start(ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
         let unlock = menu_item(ui, "Unlock", Some("The wallet kept on this device"));
         shared.autofocus(&unlock);
         if unlock.clicked() {
-            return Some(Screen::Unlock(crate::keep::Unlock::default()));
+            match crate::keep::Unlock::new(shared) {
+                Ok(unlock) => return Some(Screen::Unlock(unlock)),
+                Err(error) => shared.error(error),
+            }
         }
     }
     let new = menu_item(ui, "New seed", Some("Make 12 or 24 recovery words"));
