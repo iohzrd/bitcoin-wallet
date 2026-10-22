@@ -3850,6 +3850,7 @@ dependencies = [
  "egui_kittest",
  "getrandom 0.4.3",
  "gilrs",
+ "libc",
  "serde_json",
  "wallet-airgap",
  "wallet-core",
@@ -3879,6 +3880,7 @@ dependencies = [
  "bitcoinconsensus",
  "chacha20poly1305",
  "miniscript",
+ "serde_json",
  "thiserror 2.0.21",
  "zeroize",
 ]

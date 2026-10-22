@@ -103,6 +103,44 @@ pub fn setup_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
+/// The `.txt` files in `dirs` that hold a message to sign, newest first: its first line plain
+/// text, and no descriptor, key or setup, nor a message signed already.
+pub fn message_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<(SystemTime, PathBuf)> = (dirs.iter())
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let meta =
+                entry.metadata().ok().filter(|meta| meta.is_file() && meta.len() <= MAX_TEXT)?;
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .filter(|(_, path)| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            name.ends_with(".txt") && !name.ends_with("-signed.txt")
+        })
+        .filter(|(_, path)| {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            let first = text.trim_start_matches('\u{feff}').trim_start();
+            let wallet_file = first.starts_with('[')
+                || ["tr(", "wpkh(", "wsh(", "sh(", "pkh("]
+                    .iter()
+                    .any(|script| first.starts_with(script))
+                || wallet_airgap::setup::looks_like(&text);
+            !wallet_file && wallet_airgap::message::read(&text).is_ok()
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Where the signed message of the request at `path` goes: beside it, `name.txt` as
+/// `name-signed.txt`.
+pub fn signed_text_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{stem}-signed.txt"))
+}
+
 /// The largest text file read in looking for descriptors and setups.
 const MAX_TEXT: u64 = 64 * 1024;
 

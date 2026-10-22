@@ -10,8 +10,10 @@ mod create;
 mod fido;
 mod files;
 mod gamepad;
+mod harden;
 mod home;
 mod keep;
+mod messages;
 #[cfg(feature = "online")]
 mod online;
 mod sign;
@@ -60,6 +62,8 @@ struct Args {
 }
 
 fn main() -> eframe::Result {
+    // First, before any secret is in memory.
+    let locked = harden::harden();
     let args = Args::parse();
     let dirs = if args.dirs.is_empty() { files::default_dirs() } else { args.dirs.clone() };
     let data_dir = args.data_dir.clone().or_else(files::default_data_dir);
@@ -96,7 +100,21 @@ fn main() -> eframe::Result {
                 Some(Err(error)) => return Err(format!("--watch: {error}").into()),
                 None => {}
             }
-            Ok(Box::new(app))
+            let app = Box::new(app);
+            // The app's own state, where the open wallet's seed, words and key live, stays where
+            // it is boxed: locked there, it stays out of swap even where the rest cannot.
+            if locked != harden::Locked::All && !harden::lock(&*app) {
+                eprintln!("wallet: could not lock the app's memory; the seed may reach swap");
+            }
+            if let harden::Locked::App { limit } = locked {
+                eprintln!(
+                    "wallet: the system locks {} KiB of memory for this user: the app's state is \
+                     kept out of swap, the rest is not; `ulimit -l unlimited` (or LimitMEMLOCK=\
+                     infinity for a service) locks all of it",
+                    limit / 1024
+                );
+            }
+            Ok(app)
         }),
     )
 }

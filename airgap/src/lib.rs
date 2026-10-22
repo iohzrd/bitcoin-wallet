@@ -3,8 +3,10 @@
 //! codes in Blockchain Commons' Uniform Resources; a descriptor as text, in a file or a QR code;
 //! and a seed as a SeedQR, to copy onto paper.
 
+pub mod account;
 pub mod bcur;
 pub mod file;
+pub mod message;
 pub mod qr;
 pub mod seedqr;
 pub mod setup;

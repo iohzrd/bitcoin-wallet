@@ -225,12 +225,25 @@ impl Account {
         if *fingerprint != self.fingerprint() {
             return None;
         }
+        let derivation = self.derivation_at(path)?;
+        (self.script_pubkey(derivation) == *script_pubkey).then_some(derivation)
+    }
+
+    /// Which of the account's keys the full path `path` names: the account's own path, then a
+    /// receive or change branch and an index.
+    pub fn derivation_at(&self, path: &DerivationPath) -> Option<Derivation> {
         let rest = path.as_ref().strip_prefix(self.path().as_ref())?;
         let [ChildNumber::Normal { index: branch }, ChildNumber::Normal { index }] = *rest else {
             return None;
         };
-        let derivation = Derivation { keychain: Keychain::from_branch(branch)?, index };
-        (self.script_pubkey(derivation) == *script_pubkey).then_some(derivation)
+        Some(Derivation { keychain: Keychain::from_branch(branch)?, index })
+    }
+
+    /// Which of the account's first `within` receive and change keys pays `script_pubkey`.
+    pub fn find(&self, script_pubkey: &Script, within: u32) -> Option<Derivation> {
+        (0..within)
+            .flat_map(|index| [Derivation::receive(index), Derivation::change(index)])
+            .find(|derivation| self.script_pubkey(*derivation) == *script_pubkey)
     }
 
     /// Records in a PSBT input that it spends the key at `derivation`, which is how the signer

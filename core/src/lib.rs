@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod dice;
+pub mod message;
 pub mod multisig;
 pub mod policy;
 pub mod psbt;

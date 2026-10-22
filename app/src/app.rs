@@ -22,7 +22,7 @@ use crate::theme::{
     self, ACCENT, BAD, BG, DIM, GOOD, RADIUS, TEST_NETWORK, TEXT, body, mono, strong,
 };
 use crate::widgets::{Control, Hint, back_button, back_id, chip, hint_bar, text};
-use crate::{backup, cosign, create, home, keep, sign};
+use crate::{backup, cosign, create, home, keep, messages, sign};
 
 /// The widest the screens' column grows, on a desktop's window.
 const MAX_WIDTH: f32 = 560.0;
@@ -175,6 +175,10 @@ pub enum Screen {
     MultisigWallet(cosign::WalletScreen),
     Keep(keep::Keep),
     Unlock(keep::Unlock),
+    Messages(messages::Messages),
+    TypeMessage(messages::Typing),
+    MessageReview(messages::Review),
+    MessageSigned(messages::Signed),
     #[cfg(feature = "online")]
     Import(crate::online::Import),
     #[cfg(feature = "online")]
@@ -207,6 +211,10 @@ impl Screen {
             Screen::MultisigWallet(screen) => screen.title(),
             Screen::Keep(screen) => screen.title(),
             Screen::Unlock(screen) => screen.title(),
+            Screen::Messages(_) => "Sign a message".to_owned(),
+            Screen::TypeMessage(_) => "Type the message".to_owned(),
+            Screen::MessageReview(_) => "Review the message".to_owned(),
+            Screen::MessageSigned(_) => "Signed message".to_owned(),
             #[cfg(feature = "online")]
             Screen::Import(_) => "Watch an account".to_owned(),
             #[cfg(feature = "online")]
@@ -231,6 +239,8 @@ impl Screen {
             Screen::Setup(screen) => screen.hints(),
             Screen::Keep(screen) => screen.hints(),
             Screen::Unlock(screen) => screen.hints(),
+            Screen::TypeMessage(_) => messages::TYPING,
+            Screen::MessageReview(_) => messages::READING,
             Screen::Addresses(_) => &[
                 (Control::Shoulders, "Previous / next"),
                 (Control::A, "Select"),
@@ -265,6 +275,10 @@ impl Screen {
             Screen::MultisigWallet(screen) => screen.show(ui, shared),
             Screen::Keep(screen) => screen.show(ui, shared),
             Screen::Unlock(screen) => screen.show(ui, shared),
+            Screen::Messages(screen) => screen.show(ui, shared),
+            Screen::TypeMessage(screen) => screen.show(ui, shared),
+            Screen::MessageReview(screen) => screen.show(ui, shared),
+            Screen::MessageSigned(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]
             Screen::Import(screen) => screen.show(ui, shared),
             #[cfg(feature = "online")]

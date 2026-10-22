@@ -16,6 +16,7 @@ ctap-hid-fido2 = { workspace = true, optional = true }
 eframe.workspace = true
 getrandom.workspace = true
 gilrs.workspace = true
+libc.workspace = true
 wallet-airgap.workspace = true
 wallet-core.workspace = true
 wallet-node = { workspace = true, optional = true }

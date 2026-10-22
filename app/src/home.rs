@@ -85,6 +85,11 @@ impl Home {
                 next = Some(Screen::Addresses(Addresses::new(Which::Account)));
             }
             if signer {
+                let message =
+                    menu_item(ui, "Sign a message", Some("Show that you hold an address"));
+                if message.clicked() {
+                    next = Some(Screen::Messages(crate::messages::Messages::new(shared)));
+                }
                 let backup = menu_item(ui, "Backup", Some("Show, check or SeedQR the words"));
                 if backup.clicked() {
                     next = Some(Screen::Backup(Backup));
@@ -131,15 +136,28 @@ impl Home {
 
 /// The account's descriptor, as a QR code and a file, for a watch-only wallet to import.
 pub struct Export {
+    /// The descriptor, which the file holds.
     text: String,
+    /// The account as a `crypto-account` UR.
+    ur: String,
+    format: QrFormat,
     qr: Option<Qr>,
+}
+
+/// What the QR code holds: the account as a BC-UR, which most coordinators scan, or its
+/// descriptor as text, which Sparrow and Bitcoin Core read too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QrFormat {
+    Account,
+    Descriptor,
 }
 
 impl Export {
     fn new(shared: &Shared) -> Export {
-        let text = shared.wallet.as_ref().map(|w| w.account.descriptor().to_string());
-        let text = text.unwrap_or_default();
-        Export { qr: Qr::new(&text).ok(), text }
+        let account = shared.wallet.as_ref().map(|wallet| &wallet.account);
+        let text = account.map(|account| account.descriptor().to_string()).unwrap_or_default();
+        let ur = account.map(wallet_airgap::account::account_ur).unwrap_or_default();
+        Export { qr: Qr::new(&ur).ok(), text, ur, format: QrFormat::Account }
     }
 
     pub fn show(&mut self, ui: &mut Ui, shared: &mut Shared) -> Option<Screen> {
@@ -151,10 +169,18 @@ impl Export {
         let name = format!("{}-{kind}.txt", wallet.account.fingerprint());
         let dirs = shared.config.dirs.clone();
         let mut save = None;
+        let mut switch = false;
         beside_qr(ui, self.qr.as_ref(), |ui| {
             text(ui, "Scan it, or save it to the card, to watch this account.", body(12.5), DIM);
             text(ui, &self.text, mono(10.5), FAINT);
             ScrollArea::vertical().show(ui, |ui| {
+                let format = match self.format {
+                    QrFormat::Account => "UR crypto-account",
+                    QrFormat::Descriptor => "Descriptor text",
+                };
+                let item = menu_item(ui, "QR code", Some(format));
+                shared.autofocus(&item);
+                switch = item.clicked();
                 for dir in &dirs {
                     let label = dir.file_name().map_or_else(
                         || dir.display().to_string(),
@@ -163,13 +189,23 @@ impl Export {
                     let width = ui.available_width();
                     let button =
                         button(ui, &format!("Save to {label}"), Emphasis::Secondary, width);
-                    shared.autofocus(&button);
                     if button.clicked() {
                         save = Some(dir.join(&name));
                     }
                 }
             });
         });
+        if switch {
+            self.format = match self.format {
+                QrFormat::Account => QrFormat::Descriptor,
+                QrFormat::Descriptor => QrFormat::Account,
+            };
+            let content = match self.format {
+                QrFormat::Account => &self.ur,
+                QrFormat::Descriptor => &self.text,
+            };
+            self.qr = Qr::new(content).ok();
+        }
         if let Some(path) = save {
             match files::write(&path, self.text.as_bytes()) {
                 Ok(()) => shared.info(format!("Saved {}", path.display())),

@@ -359,10 +359,7 @@ fn the_backup_shows_the_words_checks_a_copy_and_draws_its_seedqr() {
     let mut app = app(Vec::new());
     app.open(abandon());
     let mut harness = harness(app);
-    for _ in 0..3 {
-        press(&mut harness, Key::ArrowDown);
-    }
-    press(&mut harness, Key::Enter); // Backup
+    choose(&mut harness, "Backup");
     assert!(matches!(harness.state().screen(), Screen::Backup(_)));
 
     press(&mut harness, Key::Enter); // Show the words
@@ -406,10 +403,7 @@ fn a_multisig_registers_from_the_card_and_its_psbt_takes_two_signers() {
         let mut app = app(vec![dir.clone()]);
         app.open(abandon_with(passphrase));
         let mut harness = harness(app);
-        for _ in 0..4 {
-            press(&mut harness, Key::ArrowDown);
-        }
-        press(&mut harness, Key::Enter); // Multisig
+        choose(&mut harness, "Multisig");
         press(&mut harness, Key::ArrowDown);
         press(&mut harness, Key::Enter); // Register a wallet
         press(&mut harness, Key::Enter); // vault.txt
@@ -450,10 +444,7 @@ fn registering(dir: &std::path::Path) -> Harness<'static, App> {
     let mut app = app(vec![dir.to_path_buf()]);
     app.open(abandon());
     let mut harness = harness(app);
-    for _ in 0..4 {
-        press(&mut harness, Key::ArrowDown);
-    }
-    press(&mut harness, Key::Enter); // Multisig
+    choose(&mut harness, "Multisig");
     press(&mut harness, Key::ArrowDown);
     press(&mut harness, Key::Enter); // Register a wallet
     harness
@@ -527,10 +518,7 @@ fn the_multisig_key_saves_to_the_card_for_a_coordinator() {
     let mut app = app(vec![dir.clone()]);
     app.open(abandon());
     let mut harness = harness(app);
-    for _ in 0..4 {
-        press(&mut harness, Key::ArrowDown);
-    }
-    press(&mut harness, Key::Enter); // Multisig
+    choose(&mut harness, "Multisig");
     press(&mut harness, Key::Enter); // Your key
     assert!(matches!(harness.state().screen(), Screen::CosignerKey(_)));
     press(&mut harness, Key::Enter); // Save
@@ -829,6 +817,63 @@ fn a_build_without_security_keys_offers_none_and_says_so_of_a_wallet_sealed_with
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The address and signature of a signed message's armor, checked to be for `message`.
+fn signed_by(armored: &str, message: &str) -> String {
+    let lines: Vec<&str> = armored.lines().collect();
+    assert_eq!(lines[0], "-----BEGIN BITCOIN SIGNED MESSAGE-----");
+    assert_eq!(lines[1], message);
+    let (address, signature) = (lines[3], lines[4]);
+    let script = address.parse::<wallet_core::bitcoin::Address<_>>().unwrap();
+    let script = script.require_network(Network::Regtest).unwrap().script_pubkey();
+    wallet_core::message::verify(&script, message.as_bytes(), signature).unwrap();
+    address.to_owned()
+}
+
+#[test]
+fn a_message_is_signed_from_the_card_or_the_keyboard_with_the_address_it_names() {
+    let dir = temp_dir("messages");
+    let wallet = abandon();
+    let third = wallet.account.address(Derivation::receive(3)).to_string();
+    std::fs::write(dir.join("proof.txt"), "Hello World\nm/86h/1h/0h/0/3\n").unwrap();
+    let mut app = app(vec![dir.clone()]);
+    app.open(wallet);
+    let mut harness = harness(app);
+    choose(&mut harness, "Sign a message");
+    choose(&mut harness, "proof.txt");
+    assert!(matches!(harness.state().screen(), Screen::MessageReview(_)));
+    shown(&harness, "Hello World");
+    shown(&harness, "Receive address #3");
+    choose(&mut harness, "Sign");
+    assert!(matches!(harness.state().screen(), Screen::MessageSigned(_)));
+    let armored = std::fs::read_to_string(dir.join("proof-signed.txt")).unwrap();
+    assert_eq!(signed_by(&armored, "Hello World"), third);
+    // A signed message is no request to sign.
+    press(&mut harness, Key::Escape);
+    choose(&mut harness, "Sign a message");
+    assert!(harness.query_by_label("proof-signed.txt").is_none());
+
+    choose(&mut harness, "Type a message");
+    type_text(&mut harness, "I own this");
+    harness.get_by_label("Done").click_accesskit();
+    harness.run();
+    shown(&harness, "Receive address #0");
+    choose(&mut harness, "Sign");
+    choose(&mut harness, &format!("Save to {}", dir.file_name().unwrap().to_string_lossy()));
+    let armored = std::fs::read_to_string(dir.join("signed-message.txt")).unwrap();
+    let first = abandon().account.address(Derivation::receive(0)).to_string();
+    assert_eq!(signed_by(&armored, "I own this"), first);
+
+    // A request for an address the account does not have is refused, not signed with another.
+    let elsewhere = abandon_with("someone else").account.address(Derivation::receive(0));
+    std::fs::write(dir.join("other.txt"), format!("Hi\n{elsewhere}")).unwrap();
+    press(&mut harness, Key::Escape);
+    choose(&mut harness, "Sign a message");
+    choose(&mut harness, "other.txt");
+    assert!(matches!(harness.state().screen(), Screen::Messages(_)));
+    shown(&harness, "is not among this account's first 1000 addresses");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn with_keeping_off_nothing_offers_it() {
     let mut app = app(Vec::new());
@@ -936,10 +981,7 @@ fn screenshots() {
         press(&mut harness, Key::PageDown);
         shot(&mut harness, "16-addresses");
         press(&mut harness, Key::Escape);
-        for _ in 0..3 {
-            press(&mut harness, Key::ArrowDown);
-        }
-        press(&mut harness, Key::Enter); // Backup
+        choose(&mut harness, "Backup");
         shot(&mut harness, "17-backup");
         press(&mut harness, Key::Enter); // Show the words
         shot(&mut harness, "18-backup-words");
@@ -950,10 +992,7 @@ fn screenshots() {
         shot(&mut harness, "19-seedqr");
         press(&mut harness, Key::Escape);
         press(&mut harness, Key::Escape);
-        for _ in 0..4 {
-            press(&mut harness, Key::ArrowDown);
-        }
-        press(&mut harness, Key::Enter); // Multisig
+        choose(&mut harness, "Multisig");
         shot(&mut harness, "20-multisig");
         press(&mut harness, Key::Enter); // Your key
         shot(&mut harness, "21-multisig-key");
@@ -980,6 +1019,18 @@ fn screenshots() {
             press(&mut harness, Key::ArrowDown);
         }
         shot(&mut harness, "25-review-warnings");
+        while !at_home(&harness) {
+            press(&mut harness, Key::Escape);
+        }
+        let request =
+            "I, the holder of this address, agree to the terms of the deal.\nm/86h/1h/0h/0/3\n";
+        std::fs::write(dir.join("proof.txt"), request).unwrap();
+        choose(&mut harness, "Sign a message");
+        shot(&mut harness, "25a-messages");
+        choose(&mut harness, "proof.txt");
+        shot(&mut harness, "25b-message-review");
+        choose(&mut harness, "Sign");
+        shot(&mut harness, "25c-message-signed");
         while !at_home(&harness) {
             press(&mut harness, Key::Escape);
         }
