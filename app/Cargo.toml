@@ -5,6 +5,11 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
+default = ["gamepad"]
+# Reading gamepads itself (gilrs). Off for a handheld whose system turns the buttons into keys,
+# so that the wallet needs no access to input devices; `--gamepad-hints` still draws its hints as
+# the buttons.
+gamepad = ["dep:gilrs"]
 online = ["dep:wallet-node"]
 # Sealing a kept wallet with a FIDO2 security key, over USB: off by default, as it brings a FIDO2
 # library and the HID stack into the build.
@@ -15,7 +20,7 @@ clap.workspace = true
 ctap-hid-fido2 = { workspace = true, optional = true }
 eframe.workspace = true
 getrandom.workspace = true
-gilrs.workspace = true
+gilrs = { workspace = true, optional = true }
 libc.workspace = true
 wallet-airgap.workspace = true
 wallet-core.workspace = true

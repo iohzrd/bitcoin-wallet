@@ -17,6 +17,7 @@ use wallet_core::seed::Seed;
 use wallet_core::store::Params;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "gamepad")]
 use crate::gamepad::Gamepad;
 use crate::theme::{
     self, ACCENT, BAD, BG, DIM, GOOD, RADIUS, TEST_NETWORK, TEXT, body, mono, strong,
@@ -297,7 +298,10 @@ pub struct App {
     /// The zoom: as given, or `None` to fit the layouts' height to the screen's.
     scale: Option<f32>,
     styled: bool,
+    #[cfg(feature = "gamepad")]
     gamepad: Option<Gamepad>,
+    /// Whether the hints show a gamepad's buttons whether or not one is read.
+    gamepad_hints: bool,
 }
 
 impl App {
@@ -317,12 +321,36 @@ impl App {
             refocus: false,
             frame: 0,
         };
-        App { shared, screen: Screen::Start, climbing: None, scale, styled: false, gamepad: None }
+        App {
+            shared,
+            screen: Screen::Start,
+            climbing: None,
+            scale,
+            styled: false,
+            #[cfg(feature = "gamepad")]
+            gamepad: None,
+            gamepad_hints: false,
+        }
     }
 
     /// Reads the gamepads into `ctx`'s input; see [`Gamepad::start`] for `swap_ab`.
+    #[cfg(feature = "gamepad")]
     pub fn start_gamepad(&mut self, ctx: &egui::Context, swap_ab: bool) {
         self.gamepad = Some(Gamepad::start(ctx.clone(), swap_ab));
+    }
+
+    /// Draws the hints as a gamepad's buttons, as on a handheld whose buttons arrive as keys.
+    pub fn show_gamepad_hints(&mut self) {
+        self.gamepad_hints = true;
+    }
+
+    /// Whether the hints are to show a gamepad's buttons.
+    fn gamepad(&self) -> bool {
+        #[cfg(feature = "gamepad")]
+        if self.gamepad.as_ref().is_some_and(Gamepad::connected) {
+            return true;
+        }
+        self.gamepad_hints
     }
 
     #[cfg(feature = "online")]
@@ -377,7 +405,7 @@ impl App {
         let bar = || Frame::new().fill(BG).inner_margin(Margin::symmetric(14, 0));
         let title = self.screen.title();
         let back = self.screen.has_back();
-        let gamepad = self.gamepad.as_ref().is_some_and(Gamepad::connected);
+        let gamepad = self.gamepad();
         Panel::top("title")
             .exact_size(38.0)
             .resizable(false)
@@ -456,9 +484,12 @@ impl App {
 
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut RawInput) {
+        #[cfg(feature = "gamepad")]
         if let Some(gamepad) = &self.gamepad {
             gamepad.feed(input);
         }
+        #[cfg(not(feature = "gamepad"))]
+        let _ = input;
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

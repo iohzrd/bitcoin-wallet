@@ -9,6 +9,7 @@ mod cosign;
 mod create;
 mod fido;
 mod files;
+#[cfg(feature = "gamepad")]
 mod gamepad;
 mod harden;
 mod home;
@@ -54,8 +55,13 @@ struct Args {
     #[arg(long)]
     scale: Option<f32>,
     /// Make the right face button A, as on Nintendo's layout, rather than the bottom one
+    #[cfg(feature = "gamepad")]
     #[arg(long)]
     swap_ab: bool,
+    /// Draw the hints as a gamepad's buttons rather than as keys, for a handheld whose buttons
+    /// arrive as keys
+    #[arg(long)]
+    gamepad_hints: bool,
     #[cfg(feature = "online")]
     #[command(flatten)]
     node: online::NodeArgs,
@@ -85,6 +91,8 @@ fn main() -> eframe::Result {
         "wallet",
         options,
         Box::new(move |cc| {
+            #[cfg(not(any(feature = "gamepad", feature = "online")))]
+            let _ = cc;
             #[cfg(feature = "online")]
             let online = online::Online::new(args.node.node(args.network), args.network);
             let mut app = app::App::new(
@@ -93,7 +101,11 @@ fn main() -> eframe::Result {
                 #[cfg(feature = "online")]
                 online,
             );
+            #[cfg(feature = "gamepad")]
             app.start_gamepad(&cc.egui_ctx, args.swap_ab);
+            if args.gamepad_hints {
+                app.show_gamepad_hints();
+            }
             #[cfg(feature = "online")]
             match args.node.watch(args.network) {
                 Some(Ok(account)) => app.open_watch_only(account, &cc.egui_ctx),
